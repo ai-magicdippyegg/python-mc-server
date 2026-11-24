@@ -61,12 +61,23 @@ def handle_bucket(item_name, bx, by, bz, px, py, pz, get_block_fn, air_state=0):
             swap held bucket for ``new_bucket_item``
         ``None`` — no action (water bucket on water, empty bucket on stone,
             filled bucket with no air adjacent, ...)
+
+    Note on pickup: the Minecraft client's raycast for UseItemOn ignores
+    fluids, so when a player aims at a water source with an empty bucket,
+    the packet gives the block BEHIND the water (e.g., stone floor below)
+    as the clicked block, and the water is at the adjacent position
+    (px, py, pz). We check BOTH positions for a fluid source so pickup
+    works regardless of which side the player clicks from.
     """
     if item_name == "bucket":
-        # Empty bucket: try to pick up the clicked block if it's a fluid source
-        clicked_state = get_block_fn(bx, by, bz)
-        if clicked_state in FLUID_SOURCE_STATES:
-            return ("pickup", bx, by, bz, FLUID_SOURCE_STATES[clicked_state])
+        # Empty bucket: check both the clicked block and the adjacent
+        # position for a fluid source. The client's raycast passes through
+        # fluids, so the water might be at either position depending on
+        # which face the player clicked.
+        for cx, cy, cz in [(bx, by, bz), (px, py, pz)]:
+            clicked_state = get_block_fn(cx, cy, cz)
+            if clicked_state in FLUID_SOURCE_STATES:
+                return ("pickup", cx, cy, cz, FLUID_SOURCE_STATES[clicked_state])
         return None
 
     if item_name in BUCKET_TO_FLUID:

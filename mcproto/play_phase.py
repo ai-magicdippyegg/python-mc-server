@@ -38,7 +38,7 @@ from .codec import (
     write_varint,
 )
 from .connection import log
-from .data import OVERWORLD_DIM_TYPE_ID, item_for_state
+from .data import BLOCK_STATES, OVERWORLD_DIM_TYPE_ID, item_for_state
 from .fluid import compute_flow, compute_removal, fluid_name_for_state
 from .lighting import build_light_payload
 from .placement import build_placement, decode_state
@@ -372,12 +372,34 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                 # fences/walls/panes) or a clicked-block update (for double
                 # slabs) that don't require the primary adjacent cell to be
                 # air. For a normal single-block place, the first entry IS
-                # the adjacent cell, and we only place it if it's currently
-                # air — same check as before.
+                # the adjacent cell, and we place it if it's currently air
+                # OR a fluid block (placing a block in water replaces the
+                # water — vanilla calls this "waterlogged" but for basic
+                # we just overwrite and clear the source's connected flow).
                 if plan:
                     primary_x, primary_y, primary_z, primary_state, primary_blk = plan[0]
                     is_double_slab = (primary_x == bx and primary_y == by and primary_z == bz)
-                    if is_double_slab or get_block(primary_x, primary_y, primary_z) == AIR_STATE:
+                    target_state = get_block(primary_x, primary_y, primary_z)
+                    target_is_air = (target_state == AIR_STATE)
+                    # Check if the target is a fluid block (source or flowing)
+                    target_fluid = fluid_name_for_state(target_state)
+                    if target_fluid is None and target_state != AIR_STATE:
+                        for fn in ("water", "lava"):
+                            base, count, _ = BLOCK_STATES.get(fn, (0, 0, 0))
+                            if base <= target_state < base + count:
+                                target_fluid = fn
+                                break
+                    if is_double_slab or target_is_air or target_fluid:
+                        # If overwriting a fluid SOURCE, clear its connected
+                        # flow first (same as bucket pickup).
+                        if target_fluid and target_state == BLOCK_STATES.get(target_fluid, (0, 0, 0))[2]:
+                            to_clear = compute_removal(primary_x, primary_y, primary_z,
+                                                       target_fluid,
+                                                       lambda x, y, z: get_block(x, y, z))
+                            for (cx, cy, cz) in to_clear:
+                                set_block(cx, cy, cz, AIR_STATE)
+                                conn.send_packet(Play.BLOCK_UPDATE,
+                                                  encode_block_pos(cx, cy, cz) + write_varint(AIR_STATE))
                         for (x, y, z, st, blk) in plan:
                             set_block(x, y, z, st)
                             conn.send_packet(Play.BLOCK_UPDATE, encode_block_pos(x, y, z) + write_varint(st))
@@ -386,6 +408,8 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                             extra = ""
                             if len(plan) > 1:
                                 extra = f" + {len(plan)-1} neighbour update(s)"
+                            if target_fluid:
+                                extra += f" (replaced {target_fluid})"
                             log(addr, f"placed {blk} at {x},{y},{z} {decode_state(blk, st) or ''} (held={held[0]}){extra}")
                 elif DEBUG and not plan:
                     log(addr, f"right-click with {held[0] if held else 'empty hand'}: nothing placed")
