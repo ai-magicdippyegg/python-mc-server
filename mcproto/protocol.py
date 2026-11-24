@@ -82,6 +82,10 @@ class Play:
     REMOVE_ENTITIES = 0x4E
     ROTATE_HEAD = 0x55
     TELEPORT_ENTITY = 0x80
+    # time + chat + entity data
+    SET_TIME = 0x73
+    SYSTEM_CHAT = 0x7C
+    SET_ENTITY_DATA = 0x65
     # serverbound (only the ones we use)
     S_ACCEPT_TELEPORTATION = 0x00
     S_CHAT_COMMAND = 0x07

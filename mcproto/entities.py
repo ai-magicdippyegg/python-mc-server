@@ -48,7 +48,8 @@ import threading
 import time
 import uuid as _uuid
 
-from .codec import write_bool, write_byte, write_double, write_float, write_int, write_long, write_ubyte, write_varint, write_uuid
+from .codec import write_bool, write_byte, write_double, write_float, write_int, write_item_stack, write_long, write_short, write_ubyte, write_uuid, write_varint, write_varlong
+from .data import ITEM_ID_BY_NAME
 from .protocol import Play
 
 # Entity type registry IDs (from EntityTypes class, alphabetical registration order)
@@ -62,6 +63,7 @@ ENTITY_TYPES = {
     "bat": 10,
     "bee": 11,
     "creeper": 32,
+    "item": 73,
 }
 
 # Entity id allocator
@@ -172,14 +174,44 @@ class Entity:
             if dist > 0.05:
                 speed = self._move_speed * dt
                 if dist <= speed:
-                    self.x = self._target_x
-                    self.z = self._target_z
+                    # Final step — check collision for the remaining distance
+                    new_x = self._target_x
+                    new_z = self._target_z
+                else:
+                    new_x = self.x + (dx / dist) * speed
+                    new_z = self.z + (dz / dist) * speed
+
+                # Collision check: try X and Z independently so the entity
+                # can slide along a wall (move X even if Z is blocked).
+                # Check the block at the entity's feet level.
+                feet_y = math.floor(self.y)
+                # Try X movement
+                if get_block_fn(math.floor(new_x), feet_y, math.floor(self.z)) == air_state:
+                    self.x = new_x
+                    moved = True
+                else:
+                    # X blocked — try to step up 1 block (like vanilla)
+                    if get_block_fn(math.floor(new_x), feet_y + 1, math.floor(self.z)) == air_state \
+                       and get_block_fn(math.floor(self.x), feet_y + 1, math.floor(self.z)) == air_state:
+                        self.x = new_x
+                        self.y = float(feet_y + 1)
+                        moved = True
+                # Try Z movement
+                if get_block_fn(math.floor(self.x), feet_y, math.floor(new_z)) == air_state:
+                    self.z = new_z
+                    moved = True
+                else:
+                    # Z blocked — try to step up 1 block
+                    if get_block_fn(math.floor(self.x), feet_y + 1, math.floor(new_z)) == air_state \
+                       and get_block_fn(math.floor(self.x), feet_y + 1, math.floor(self.z)) == air_state:
+                        self.z = new_z
+                        self.y = float(feet_y + 1)
+                        moved = True
+
+                if dist <= speed:
+                    # Reached target
                     self._move_speed = 0.0
                     self._next_move_time = now + random.uniform(1, 3)
-                else:
-                    self.x += (dx / dist) * speed
-                    self.z += (dz / dist) * speed
-                moved = True
 
         return moved
 
@@ -248,3 +280,90 @@ def send_remove_entities(conn, entity_ids):
     for eid in entity_ids:
         payload += write_varint(eid)
     conn.send_packet(Play.REMOVE_ENTITIES, bytes(payload))
+
+
+# ---------------------------------------------------------------------------
+# Item entity metadata: SetEntityDataPacket with the ItemStack at index 8.
+# Format (decompiled from ClientboundSetEntityDataPacket + EntityDataSerializers):
+#   VarInt entity_id
+#   For each entry: UByte index, VarInt serializer_id, value
+#   UByte 0xFF (terminator)
+#
+# ItemStack serializer ID = 7 (EntityDataSerializers.ITEM_STACK, 8th registered).
+# ItemEntity stores its ItemStack at metadata index 8 (after Entity's 0-7).
+# The ItemStack value uses the same format as write_item_stack in codec.py.
+# ---------------------------------------------------------------------------
+
+def send_item_entity_data(conn, entity_id, item_name, count=1):
+    """Send SetEntityDataPacket so the client knows what item an item entity
+    represents. Without this, the client renders nothing (or a default shape)."""
+    if item_name not in ITEM_ID_BY_NAME:
+        return
+    payload = bytearray()
+    payload += write_varint(entity_id)
+    # Entry: index=8 (ItemEntity.DATA_ITEM), serializer=7 (ITEM_STACK)
+    payload += write_ubyte(8)
+    payload += write_varint(7)
+    # ItemStack value: VarInt count, VarInt item_id, VarInt 0 (added), VarInt 0 (removed)
+    payload += write_varint(count)
+    payload += write_varint(ITEM_ID_BY_NAME[item_name])
+    payload += write_varint(0)
+    payload += write_varint(0)
+    # Terminator
+    payload += write_ubyte(0xFF)
+    conn.send_packet(Play.SET_ENTITY_DATA, bytes(payload))
+
+
+# ---------------------------------------------------------------------------
+# Day/night cycle: SetTimePacket.
+# Format (26.3, decompiled):
+#   Long gameTime (total world ticks)
+#   Map<WorldClock, ClockNetworkState>:
+#     VarInt entry_count
+#     For each: WorldClock key (VarInt holder ID) + ClockNetworkState value
+#   ClockNetworkState: VarLong totalTicks, Float partialTick, Float rate
+# ---------------------------------------------------------------------------
+
+def send_set_time(conn, game_time, time_of_day):
+    """Send ClientboundSetTimePacket to update the world clock.
+    game_time: total ticks since world start (monotonically increasing).
+    time_of_day: 0-23999 (wraps at 24000). 0=dawn, 6000=noon, 12000=dusk, 18000=midnight."""
+    payload = bytearray()
+    payload += write_long(game_time)
+    # 1 map entry: WorldClock holder 0 (overworld) + ClockNetworkState
+    payload += write_varint(1)  # entry count
+    payload += write_varint(0)  # WorldClock registry ID (overworld)
+    payload += write_varlong(int(time_of_day))  # totalTicks
+    payload += write_float(0.0)  # partialTick
+    payload += write_float(1.0)  # rate (1.0 = normal time flow)
+    conn.send_packet(Play.SET_TIME, bytes(payload))
+
+
+# ---------------------------------------------------------------------------
+# Chat: SystemChatPacket.
+# Format (decompiled):
+#   Component content (NBT-encoded text component)
+#   Bool overlay
+#
+# A simple text component {"text": "hello"} is sent as NBT:
+#   0x0A (compound), 0x08 (string) + name("text") + value, 0x00 (end)
+# NBT strings use unsigned-short length prefixes (not VarInt).
+# ---------------------------------------------------------------------------
+
+def _nbt_string(name, value):
+    """Encode an NBT string entry: type byte + name (ushort len + UTF-8) + value."""
+    nb = name.encode('utf-8')
+    vb = value.encode('utf-8')
+    return (b'\x08' + struct.pack('>H', len(nb)) + nb +
+            struct.pack('>H', len(vb)) + vb)
+
+def _nbt_text_component(text):
+    """Encode a simple {"text": "..."} component as root-nameless NBT compound."""
+    return b'\x0a' + _nbt_string('text', text) + b'\x00'
+
+def send_chat(conn, text):
+    """Send ClientboundSystemChatPacket with a simple text message."""
+    payload = bytearray()
+    payload += _nbt_text_component(text)
+    payload += write_bool(False)  # not an overlay (shows in chat, not action bar)
+    conn.send_packet(Play.SYSTEM_CHAT, bytes(payload))

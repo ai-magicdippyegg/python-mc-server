@@ -38,8 +38,17 @@ from .codec import (
     write_varint,
 )
 from .connection import log
-from .data import BLOCK_STATES, OVERWORLD_DIM_TYPE_ID, item_for_state
-from .entities import Entity, ENTITY_TYPES, send_add_entity, send_remove_entities, send_teleport_entity
+from .data import BLOCK_STATES, ITEM_ID_BY_NAME, OVERWORLD_DIM_TYPE_ID, item_for_state
+from .entities import (
+    ENTITY_TYPES,
+    Entity,
+    send_add_entity,
+    send_chat,
+    send_item_entity_data,
+    send_remove_entities,
+    send_set_time,
+    send_teleport_entity,
+)
 from .fluid import compute_flow, compute_removal, fluid_name_for_state
 from .lighting import build_light_payload
 from .placement import build_placement, decode_state
@@ -62,6 +71,21 @@ from .world import (
 
 VIEW_RADIUS = 4
 SPAWN_X, SPAWN_Y, SPAWN_Z = 8, 1, 8
+
+# Chat broadcast: list of (conn, username) for all connected players.
+# Used by /say, /me, join/leave notifications.
+_chat_listeners = []
+_chat_listeners_lock = threading.Lock()
+
+def broadcast_chat(text):
+    """Send a chat message to all connected players."""
+    with _chat_listeners_lock:
+        listeners = list(_chat_listeners)
+    for conn, name in listeners:
+        try:
+            send_chat(conn, text)
+        except (ConnectionError, OSError):
+            pass
 
 # mutable teleport id counter, boxed in a list so handle_play can rewrite it
 # from a nested scope without `nonlocal`
@@ -281,6 +305,7 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
     # ---- Entity AI tick loop: moves entities and sends teleport packets.
     # Runs at 20 ticks/sec (50ms) to match vanilla — the client interpolates
     # position updates at this rate so movement looks smooth.
+    # Also picks up nearby item entities (adds to inventory, despawns).
     entity_state = {"alive": True}
     def entity_tick_loop():
         last_tick = time.time()
@@ -293,11 +318,73 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                 for ent in entities:
                     if ent.alive and ent.tick(dt, lambda x, y, z: get_block(x, y, z)):
                         send_teleport_entity(conn, ent)
+                # Item pickup: check if any item entity is near the player
+                px2, py2, pz2 = pos_state[0], pos_state[1], pos_state[2]
+                for ent in list(entities):
+                    if not ent.alive or ent.type != ENTITY_TYPES.get("item"):
+                        continue
+                    dx = ent.x - px2
+                    dy = ent.y - py2
+                    dz = ent.z - pz2
+                    if dx*dx + dy*dy + dz*dz < 2.25:  # within 1.5 blocks
+                        # Pick up: add to inventory, remove entity
+                        item_name = getattr(ent, '_item_name', None)
+                        item_count = getattr(ent, '_item_count', 1)
+                        if item_name:
+                            # Find an empty slot or stack with same item
+                            placed = False
+                            for slot in range(9, 45):
+                                cur = inventory.get(slot)
+                                if cur and cur[0] == item_name and cur[1] < 64:
+                                    inventory[slot] = (item_name, cur[1] + item_count)
+                                    conn.send_packet(Play.CONTAINER_SET_SLOT,
+                                                      write_varint(0) + write_varint(0) + write_short(slot) +
+                                                      write_item_stack(item_name, cur[1] + item_count))
+                                    placed = True
+                                    break
+                            if not placed:
+                                for slot in range(9, 45):
+                                    if slot not in inventory:
+                                        inventory[slot] = (item_name, item_count)
+                                        conn.send_packet(Play.CONTAINER_SET_SLOT,
+                                                          write_varint(0) + write_varint(0) + write_short(slot) +
+                                                          write_item_stack(item_name, item_count))
+                                        placed = True
+                                        break
+                            if placed:
+                                ent.alive = False
+                                send_remove_entities(conn, [ent.id])
+                                if DEBUG:
+                                    log(addr, f"picked up item {item_name} x{item_count}")
             except (ConnectionError, OSError):
                 entity_state["alive"] = False
                 return
     ent_thread = threading.Thread(target=entity_tick_loop, daemon=True)
     ent_thread.start()
+
+    # ---- Day/night cycle: send SetTimePacket every second so the world
+    # clock advances. Time wraps at 24000 (one Minecraft day = 20 minutes
+    # real time at 20 ticks/sec).
+    time_state = {"alive": True, "game_time": 0, "time_of_day": 6000}  # start at noon
+    def time_thread():
+        while time_state["alive"]:
+            time.sleep(1.0)  # update every second
+            time_state["game_time"] += 20  # 20 ticks per second
+            time_state["time_of_day"] = (time_state["time_of_day"] + 20) % 24000
+            try:
+                send_set_time(conn, time_state["game_time"], time_state["time_of_day"])
+            except (ConnectionError, OSError):
+                time_state["alive"] = False
+                return
+    time_thread_obj = threading.Thread(target=time_thread, daemon=True)
+    time_thread_obj.start()
+
+    # Send a welcome chat message
+    send_chat(conn, f"Welcome, {username}!")
+    # Register as a chat listener (for /say, /me, join/leave broadcasts)
+    with _chat_listeners_lock:
+        _chat_listeners.append((conn, username))
+    broadcast_chat(f"{username} joined the game")
 
     try:
         while True:
@@ -536,14 +623,47 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                     continue
                 # 0 = START_DESTROY_BLOCK: creative mode breaks instantly
                 if action == 0:
-                    # If breaking a fluid SOURCE, also clear its connected
-                    # flow (same as bucket pickup). Breaking a FLOWING block
-                    # only removes that one block — the rest of the stream
-                    # stays (might look odd, but the player can break the
-                    # source to clear everything). This avoids the
-                    # "accidentally break one block, lose the whole stream"
-                    # problem.
+                    # ---- Entity damage: check if an entity is at/near the
+                    # clicked position. If yes, remove it (the player attacked
+                    # the entity, not the block). Check within ~1.5 blocks.
+                    hit_entity = None
+                    for ent in entities:
+                        if not ent.alive or ent.type == ENTITY_TYPES.get("item"):
+                            continue
+                        edx = ent.x - (bx + 0.5)
+                        edy = ent.y - (by + 0.5)
+                        edz = ent.z - (bz + 0.5)
+                        if edx*edx + edy*edy + edz*edz < 4.0:  # within ~2 blocks
+                            hit_entity = ent
+                            break
+                    if hit_entity:
+                        hit_entity.alive = False
+                        send_remove_entities(conn, [hit_entity.id])
+                        if DEBUG:
+                            log(addr, f"killed entity {hit_entity.id} at {bx},{by},{bz}")
+                        # Item drop from killed entity: drop the entity's "loot"
+                        # For basic, animals drop their corresponding item (e.g.
+                        # chicken drops chicken item). Use the entity type name.
+                        ent_loot = {ENTITY_TYPES["chicken"]: "chicken",
+                                    ENTITY_TYPES["cow"]: "beef",
+                                    ENTITY_TYPES["pig"]: "porkchop",
+                                    ENTITY_TYPES["sheep"]: "mutton"}.get(hit_entity.type)
+                        if ent_loot and ent_loot in ITEM_ID_BY_NAME:
+                            import math as _m
+                            item_ent = Entity(ENTITY_TYPES["item"],
+                                              hit_entity.x, hit_entity.y, hit_entity.z)
+                            item_ent._item_name = ent_loot
+                            item_ent._item_count = 1
+                            entities.append(item_ent)
+                            send_add_entity(conn, item_ent)
+                            send_item_entity_data(conn, item_ent.id, ent_loot, 1)
+                        conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
+                        continue  # don't break the block
+
+                    # ---- Block break: capture the block state before breaking
+                    # (needed for item drops + fluid cleanup + redstone recompute).
                     broken_state = get_block(bx, by, bz)
+                    broken_name = block_name_for_state(broken_state)
                     fname = fluid_name_for_state(broken_state)
                     to_clear = []
                     if fname:
@@ -561,7 +681,6 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                         log(addr, f"broke block at {bx},{by},{bz}{extra}")
                     # If a redstone block was broken (or adjacent to redstone),
                     # recompute the power grid around the break point.
-                    broken_name = block_name_for_state(broken_state)
                     if is_redstone_block(broken_name):
                         updates = recompute_power(bx, by, bz,
                                                   lambda x, y, z: get_block(x, y, z))
@@ -571,6 +690,21 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                                               encode_block_pos(rx, ry, rz) + write_varint(rstate))
                         if DEBUG and updates:
                             log(addr, f"  redstone: {len(updates)} block(s) updated after break")
+
+                    # ---- Item drop: spawn an item entity with the block's item.
+                    # Skip fluids (water/lava) and air — no item to drop.
+                    drop_item = None
+                    if broken_name not in ("air", "water", "lava", "powder_snow",
+                                            "bubble_column", "cave_air", "void_air"):
+                        drop_item = item_for_state(broken_state)
+                    if drop_item and drop_item in ITEM_ID_BY_NAME:
+                        item_ent = Entity(ENTITY_TYPES["item"],
+                                          bx + 0.5, by + 0.5, bz + 0.5)
+                        item_ent._item_name = drop_item
+                        item_ent._item_count = 1
+                        entities.append(item_ent)
+                        send_add_entity(conn, item_ent)
+                        send_item_entity_data(conn, item_ent.id, drop_item, 1)
 
                 conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
 
@@ -620,8 +754,29 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                 if command == "spawn" or command.startswith("spawn "):
                     pending_teleport[0] = send_teleport(conn, SPAWN_X + 0.5, SPAWN_Y, SPAWN_Z + 0.5)
                     pos_state[:] = [SPAWN_X + 0.5, SPAWN_Y, SPAWN_Z + 0.5, 0.0, 0.0]
+                    send_chat(conn, "Teleported to spawn.")
                     if DEBUG:
                         log(addr, "teleported to spawn via /spawn")
+                elif command.startswith("say "):
+                    # /say <message> — broadcast to all connected players
+                    msg = command[4:]
+                    broadcast_chat(f"[{username}] {msg}")
+                elif command.startswith("me "):
+                    # /me <action> — broadcast action to all connected players
+                    msg = command[3:]
+                    broadcast_chat(f"* {username} {msg}")
+                elif command == "time day":
+                    time_state["time_of_day"] = 1000
+                    send_set_time(conn, time_state["game_time"], 1000)
+                    send_chat(conn, "Time set to day.")
+                elif command == "time night":
+                    time_state["time_of_day"] = 13000
+                    send_set_time(conn, time_state["game_time"], 13000)
+                    send_chat(conn, "Time set to night.")
+                elif command == "time noon":
+                    time_state["time_of_day"] = 6000
+                    send_set_time(conn, time_state["game_time"], 6000)
+                    send_chat(conn, "Time set to noon.")
 
             elif pid == Play.S_MOVE_PLAYER_ROT:
                 if pending_teleport[0] is not None:
@@ -739,7 +894,12 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
     finally:
         state["alive"] = False
         entity_state["alive"] = False
+        time_state["alive"] = False
         active_sessions.pop(uuid_key, None)
+        # Unregister chat listener + broadcast leave
+        with _chat_listeners_lock:
+            _chat_listeners = [(c, n) for c, n in _chat_listeners if c is not conn]
+        broadcast_chat(f"{username} left the game")
         # Despawn all entities for this player
         try:
             send_remove_entities(conn, [e.id for e in entities if e.alive])
