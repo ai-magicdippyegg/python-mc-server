@@ -18,6 +18,7 @@ import threading
 import time
 
 from . import DEBUG
+from .bucket import BUCKETS, handle_bucket
 from .codec import (
     decode_block_pos,
     encode_block_pos,
@@ -291,12 +292,49 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                 }.get(face, (0, 1, 0))
                 px, py, pz = bx + dx, by + dy, bz + dz
 
+                from .data import ITEM_TO_BLOCK_NAME
+                held = inventory.get(held_slot_box[0] + 36)
+
+                # ---- Buckets: place fluid from a filled bucket, or pick up a
+                # fluid source with an empty bucket. Handled before regular
+                # block placement because buckets aren't blocks (they're not
+                # in ITEM_TO_BLOCK_NAME) so the regular path would do nothing.
+                if held and held[0] in BUCKETS:
+                    action = handle_bucket(
+                        held[0], bx, by, bz, px, py, pz,
+                        lambda x, y, z: get_block(x, y, z),
+                        air_state=AIR_STATE,
+                    )
+                    if action is not None:
+                        kind = action[0]
+                        if kind == "place":
+                            _, fx, fy, fz, fluid_state = action
+                            set_block(fx, fy, fz, fluid_state)
+                            conn.send_packet(Play.BLOCK_UPDATE,
+                                              encode_block_pos(fx, fy, fz) + write_varint(fluid_state))
+                            if DEBUG:
+                                log(addr, f"placed fluid state {fluid_state} at {fx},{fy},{fz} (held={held[0]})")
+                        elif kind == "pickup":
+                            _, fx, fy, fz, new_item = action
+                            set_block(fx, fy, fz, AIR_STATE)
+                            conn.send_packet(Play.BLOCK_UPDATE,
+                                              encode_block_pos(fx, fy, fz) + write_varint(AIR_STATE))
+                            # swap held bucket for the filled variant
+                            hot = held_slot_box[0] + 36
+                            inventory[hot] = (new_item, 1)
+                            conn.send_packet(Play.CONTAINER_SET_SLOT,
+                                              write_varint(0) + write_varint(0) + write_short(hot) +
+                                              write_item_stack(new_item, 1))
+                            if DEBUG:
+                                log(addr, f"picked up fluid at {fx},{fy},{fz}, swapped to {new_item}")
+                        conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
+                        continue  # skip regular block placement
+
+                # ---- Regular block placement ----
                 # only place when the held item is one that has a block form
                 # (see ITEM_TO_BLOCK_STATE); an empty hand or a tool/food/etc
                 # does nothing. The ack below is still sent so the client
                 # doesn't wait on a prediction.
-                from .data import ITEM_TO_BLOCK_NAME
-                held = inventory.get(held_slot_box[0] + 36)
                 plan = None
                 if held and held[0] in ITEM_TO_BLOCK_NAME:
                     plan = build_placement(held[0], bx, by, bz, face, cursor_y,
