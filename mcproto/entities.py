@@ -47,7 +47,7 @@ import threading
 import time
 import uuid as _uuid
 
-from .codec import write_bool, write_byte, write_double, write_float, write_int, write_long, write_varint, write_uuid
+from .codec import write_bool, write_byte, write_double, write_float, write_int, write_long, write_ubyte, write_varint, write_uuid
 from .protocol import Play
 
 # Entity type registry IDs (from EntityTypes class, alphabetical registration order)
@@ -134,6 +134,14 @@ class Entity:
         return False
 
 
+def _pack_degrees(degrees):
+    """Pack a 0-360 degree angle as a single byte (0-255), as Minecraft's
+    protocol expects. Uses unsigned byte packing since packed degrees are
+    0-255 (the client reads them as signed -128..127, which is the same
+    bits — the protocol is the same either way)."""
+    return write_ubyte(int(degrees * 256 / 360) & 0xFF)
+
+
 def send_add_entity(conn, entity):
     """Send ClientboundAddEntityPacket to spawn an entity on the client."""
     payload = bytearray()
@@ -144,9 +152,9 @@ def send_add_entity(conn, entity):
     payload += write_double(entity.y)
     payload += write_double(entity.z)
     payload += b"\x00"  # LpVec3: byte 0 = Vec3.ZERO (no initial movement)
-    payload += write_byte(int(entity.pitch * 256 / 360))  # packed degrees
-    payload += write_byte(int(entity.yaw * 256 / 360))
-    payload += write_byte(int(entity.yaw * 256 / 360))  # yHeadRot = yaw
+    payload += _pack_degrees(entity.pitch)
+    payload += _pack_degrees(entity.yaw)
+    payload += _pack_degrees(entity.yaw)  # yHeadRot = yaw
     payload += write_varint(0)  # data
     conn.send_packet(Play.ADD_ENTITY, bytes(payload))
 
