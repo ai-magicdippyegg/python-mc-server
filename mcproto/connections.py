@@ -165,8 +165,8 @@ def compute_connection_state(block_name, x, y, z, get_block_fn, default_state):
 
     connects_fn = _CONNECTS_FNS[cat]
     want = {}
-    for dir_name, dx, _, prop_on_this, _ in _DIRS:
-        nx, nz = x + dx, z
+    for dir_name, dx, dz, prop_on_this, _ in _DIRS:
+        nx, nz = x + dx, z + dz
         nstate = get_block_fn(nx, y, nz)
         # need the neighbour's block name
         from .world import block_name_for_state
@@ -194,9 +194,9 @@ def collect_neighbor_updates(block_name, x, y, z, get_block_fn):
         return []
 
     updates = []
-    for dir_name, dx, _, prop_on_this, prop_on_neighbour in _DIRS:
+    for dir_name, dx, dz, prop_on_this, prop_on_neighbour in _DIRS:
         # The neighbour in this direction:
-        nx, nz = x + dx, z
+        nx, nz = x + dx, z + dz
         nstate = get_block_fn(nx, y, nz)
         if nstate == 0:
             continue
