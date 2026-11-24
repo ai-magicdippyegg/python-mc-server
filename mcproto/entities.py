@@ -160,7 +160,19 @@ def send_add_entity(conn, entity):
 
 
 def send_teleport_entity(conn, entity):
-    """Send ClientboundTeleportEntityPacket to update an entity's position."""
+    """Send ClientboundTeleportEntityPacket to update an entity's position.
+
+    Wire format (decompiled from ClientboundTeleportEntityPacket.STREAM_CODEC):
+      VarInt entity_id
+      PositionMoveRotation:
+        Double x, Double y, Double z        (position — Vec3.STREAM_CODEC)
+        Double dx, Double dy, Double dz     (delta movement — Vec3.STREAM_CODEC)
+        Float yaw, Float pitch              (ByteBufCodecs.FLOAT)
+      Int relatives                          (4-byte big-endian bitmask, NOT VarInt —
+                                             Relative.SET_STREAM_CODEC uses ByteBufCodecs.INT
+                                             which is readInt/writeInt, not VarInt)
+      Bool onGround                          (1 byte: 0 or 1)
+    """
     payload = bytearray()
     payload += write_varint(entity.id)
     # PositionMoveRotation: 3 doubles (pos) + 3 doubles (delta) + 2 floats (yaw, pitch)
@@ -172,7 +184,7 @@ def send_teleport_entity(conn, entity):
     payload += write_double(0.0)  # delta z
     payload += write_float(entity.yaw)
     payload += write_float(entity.pitch)
-    payload += write_varint(0)  # relatives: 0 = all absolute
+    payload += write_int(0)  # relatives: 4-byte int bitmask (0 = all absolute)
     payload += write_bool(True)  # onGround
     conn.send_packet(Play.TELEPORT_ENTITY, bytes(payload))
 
