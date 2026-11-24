@@ -50,8 +50,10 @@ from .player import (
     update_player,
 )
 from .protocol import Play
+from .redstone import is_lever, is_redstone_block, recompute_power, toggle_lever
 from .world import (
     AIR_STATE,
+    block_name_for_state,
     build_chunk_column,
     get_block,
     set_block,
@@ -296,6 +298,32 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                 from .data import ITEM_TO_BLOCK_NAME
                 held = inventory.get(held_slot_box[0] + 36)
 
+                # ---- Lever toggle: right-click on a placed lever toggles it.
+                # Checked before bucket/placement so the lever activates even
+                # when the player is holding an item. (Vanilla uses sneak to
+                # place instead of toggle; we skip that for basic.)
+                clicked_state = get_block(bx, by, bz)
+                clicked_name = block_name_for_state(clicked_state)
+                if is_lever(clicked_name):
+                    new_lever_state = toggle_lever(clicked_state)
+                    set_block(bx, by, bz, new_lever_state)
+                    conn.send_packet(Play.BLOCK_UPDATE,
+                                      encode_block_pos(bx, by, bz) + write_varint(new_lever_state))
+                    if DEBUG:
+                        props = decode_state("lever", new_lever_state)
+                        log(addr, f"toggled lever at {bx},{by},{bz} (powered={props.get('powered')})")
+                    # Recompute redstone power grid around the lever
+                    updates = recompute_power(bx, by, bz,
+                                              lambda x, y, z: get_block(x, y, z))
+                    for (rx, ry, rz, rstate) in updates:
+                        set_block(rx, ry, rz, rstate)
+                        conn.send_packet(Play.BLOCK_UPDATE,
+                                          encode_block_pos(rx, ry, rz) + write_varint(rstate))
+                    if DEBUG and updates:
+                        log(addr, f"  redstone: {len(updates)} block(s) updated")
+                    conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
+                    continue  # skip placement
+
                 # ---- Buckets: place fluid from a filled bucket, or pick up a
                 # fluid source with an empty bucket. Handled before regular
                 # block placement because buckets aren't blocks (they're not
@@ -411,6 +439,17 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                             if target_fluid:
                                 extra += f" (replaced {target_fluid})"
                             log(addr, f"placed {blk} at {x},{y},{z} {decode_state(blk, st) or ''} (held={held[0]}){extra}")
+                        # If a redstone block was placed, recompute the power grid
+                        if is_redstone_block(primary_blk):
+                            rx, ry, rz = primary_x, primary_y, primary_z
+                            updates = recompute_power(rx, ry, rz,
+                                                      lambda x, y, z: get_block(x, y, z))
+                            for (rx2, ry2, rz2, rstate) in updates:
+                                set_block(rx2, ry2, rz2, rstate)
+                                conn.send_packet(Play.BLOCK_UPDATE,
+                                                  encode_block_pos(rx2, ry2, rz2) + write_varint(rstate))
+                            if DEBUG and updates:
+                                log(addr, f"  redstone: {len(updates)} block(s) updated after placement")
                 elif DEBUG and not plan:
                     log(addr, f"right-click with {held[0] if held else 'empty hand'}: nothing placed")
 
@@ -479,6 +518,18 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                     if DEBUG:
                         extra = f", cleared {len(to_clear)} connected flow blocks" if to_clear else ""
                         log(addr, f"broke block at {bx},{by},{bz}{extra}")
+                    # If a redstone block was broken (or adjacent to redstone),
+                    # recompute the power grid around the break point.
+                    broken_name = block_name_for_state(broken_state)
+                    if is_redstone_block(broken_name):
+                        updates = recompute_power(bx, by, bz,
+                                                  lambda x, y, z: get_block(x, y, z))
+                        for (rx, ry, rz, rstate) in updates:
+                            set_block(rx, ry, rz, rstate)
+                            conn.send_packet(Play.BLOCK_UPDATE,
+                                              encode_block_pos(rx, ry, rz) + write_varint(rstate))
+                        if DEBUG and updates:
+                            log(addr, f"  redstone: {len(updates)} block(s) updated after break")
 
                 conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
 
