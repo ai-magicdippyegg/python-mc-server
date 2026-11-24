@@ -39,6 +39,7 @@ from .codec import (
 )
 from .connection import log
 from .data import OVERWORLD_DIM_TYPE_ID, item_for_state
+from .fluid import compute_flow, compute_removal, fluid_name_for_state
 from .lighting import build_light_payload
 from .placement import build_placement, decode_state
 from .player import (
@@ -312,13 +313,39 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                             set_block(fx, fy, fz, fluid_state)
                             conn.send_packet(Play.BLOCK_UPDATE,
                                               encode_block_pos(fx, fy, fz) + write_varint(fluid_state))
+                            # Spread the flow: compute all flowing/falling blocks
+                            # that should exist around this source and place them.
+                            fname = {89: "water", 105: "lava", 30519: None}.get(fluid_state)
+                            if fname:
+                                flow = compute_flow(fx, fy, fz, fname,
+                                                    lambda x, y, z: get_block(x, y, z),
+                                                    air_state=AIR_STATE)
+                                for (fx2, fy2, fz2, fstate) in flow:
+                                    set_block(fx2, fy2, fz2, fstate)
+                                    conn.send_packet(Play.BLOCK_UPDATE,
+                                                      encode_block_pos(fx2, fy2, fz2) + write_varint(fstate))
+                                if DEBUG and flow:
+                                    log(addr, f"fluid {fname} spread: placed {len(flow)} flowing blocks from ({fx},{fy},{fz})")
                             if DEBUG:
                                 log(addr, f"placed fluid state {fluid_state} at {fx},{fy},{fz} (held={held[0]})")
                         elif kind == "pickup":
                             _, fx, fy, fz, new_item = action
+                            # Before removing the source, find all connected
+                            # flowing blocks so we can clear them too.
+                            fname = fluid_name_for_state(get_block(fx, fy, fz))
+                            to_clear = []
+                            if fname:
+                                to_clear = compute_removal(fx, fy, fz, fname,
+                                                           lambda x, y, z: get_block(x, y, z))
+                            # Remove the source
                             set_block(fx, fy, fz, AIR_STATE)
                             conn.send_packet(Play.BLOCK_UPDATE,
                                               encode_block_pos(fx, fy, fz) + write_varint(AIR_STATE))
+                            # Remove all connected flowing blocks
+                            for (cx, cy, cz) in to_clear:
+                                set_block(cx, cy, cz, AIR_STATE)
+                                conn.send_packet(Play.BLOCK_UPDATE,
+                                                  encode_block_pos(cx, cy, cz) + write_varint(AIR_STATE))
                             # swap held bucket for the filled variant
                             hot = held_slot_box[0] + 36
                             inventory[hot] = (new_item, 1)
@@ -326,7 +353,8 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                                               write_varint(0) + write_varint(0) + write_short(hot) +
                                               write_item_stack(new_item, 1))
                             if DEBUG:
-                                log(addr, f"picked up fluid at {fx},{fy},{fz}, swapped to {new_item}")
+                                log(addr, f"picked up fluid at {fx},{fy},{fz}, swapped to {new_item}"
+                                           + (f", cleared {len(to_clear)} flowing blocks" if to_clear else ""))
                         conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
                         continue  # skip regular block placement
 
@@ -404,11 +432,29 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                     continue
                 # 0 = START_DESTROY_BLOCK: creative mode breaks instantly
                 if action == 0:
+                    # If breaking a fluid SOURCE, also clear its connected
+                    # flow (same as bucket pickup). Breaking a FLOWING block
+                    # only removes that one block — the rest of the stream
+                    # stays (might look odd, but the player can break the
+                    # source to clear everything). This avoids the
+                    # "accidentally break one block, lose the whole stream"
+                    # problem.
+                    broken_state = get_block(bx, by, bz)
+                    fname = fluid_name_for_state(broken_state)
+                    to_clear = []
+                    if fname:
+                        to_clear = compute_removal(bx, by, bz, fname,
+                                                   lambda x, y, z: get_block(x, y, z))
                     set_block(bx, by, bz, AIR_STATE)
                     conn.send_packet(Play.BLOCK_UPDATE,
                                       encode_block_pos(bx, by, bz) + write_varint(AIR_STATE))
+                    for (cx, cy, cz) in to_clear:
+                        set_block(cx, cy, cz, AIR_STATE)
+                        conn.send_packet(Play.BLOCK_UPDATE,
+                                          encode_block_pos(cx, cy, cz) + write_varint(AIR_STATE))
                     if DEBUG:
-                        log(addr, f"broke block at {bx},{by},{bz}")
+                        extra = f", cleared {len(to_clear)} connected flow blocks" if to_clear else ""
+                        log(addr, f"broke block at {bx},{by},{bz}{extra}")
 
                 conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
 
