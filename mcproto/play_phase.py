@@ -339,14 +339,26 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                 if held and held[0] in ITEM_TO_BLOCK_NAME:
                     plan = build_placement(held[0], bx, by, bz, face, cursor_y,
                                            pos_state[3], pos_state[4],
-                                           lambda x, y, z: get_block(x, y, z) == AIR_STATE)
-                if plan and get_block(px, py, pz) == AIR_STATE:
-                    for (x, y, z, st, blk) in plan:
-                        set_block(x, y, z, st)
-                        conn.send_packet(Play.BLOCK_UPDATE, encode_block_pos(x, y, z) + write_varint(st))
-                    if DEBUG:
-                        x, y, z, st, blk = plan[0]
-                        log(addr, f"placed {blk} at {x},{y},{z} {decode_state(blk, st) or ''} (held={held[0]})")
+                                           get_block, AIR_STATE)
+                # The plan may include neighbour-connection updates (for
+                # fences/walls/panes) or a clicked-block update (for double
+                # slabs) that don't require the primary adjacent cell to be
+                # air. For a normal single-block place, the first entry IS
+                # the adjacent cell, and we only place it if it's currently
+                # air — same check as before.
+                if plan:
+                    primary_x, primary_y, primary_z, primary_state, primary_blk = plan[0]
+                    is_double_slab = (primary_x == bx and primary_y == by and primary_z == bz)
+                    if is_double_slab or get_block(primary_x, primary_y, primary_z) == AIR_STATE:
+                        for (x, y, z, st, blk) in plan:
+                            set_block(x, y, z, st)
+                            conn.send_packet(Play.BLOCK_UPDATE, encode_block_pos(x, y, z) + write_varint(st))
+                        if DEBUG:
+                            x, y, z, st, blk = plan[0]
+                            extra = ""
+                            if len(plan) > 1:
+                                extra = f" + {len(plan)-1} neighbour update(s)"
+                            log(addr, f"placed {blk} at {x},{y},{z} {decode_state(blk, st) or ''} (held={held[0]}){extra}")
                 elif DEBUG and not plan:
                     log(addr, f"right-click with {held[0] if held else 'empty hand'}: nothing placed")
 

@@ -113,3 +113,38 @@ BIOME_LIST = REGISTRIES["worldgen/biome"]
 PLAINS_BIOME_ID = BIOME_LIST.index("plains")
 DIMENSION_TYPE_LIST = REGISTRIES["dimension_type"]
 OVERWORLD_DIM_TYPE_ID = DIMENSION_TYPE_LIST.index("overworld")
+
+
+# ---------------------------------------------------------------------------
+# Block state <-> {property: value} translation. Lives here (rather than
+# in placement.py) so the connection / lighting / play_phase modules can
+# all import it without pulling placement's player-context helpers.
+# ---------------------------------------------------------------------------
+
+def state_for(block_name, wanted):
+    """State id for block_name with the given {property: value-string} overrides
+    applied on top of the block's default state."""
+    base, count, default = BLOCK_STATES[block_name]
+    props = BLOCK_PROPS.get(block_name)
+    if not props:
+        return default
+    off = default - base
+    stride = count
+    result = base
+    for name, values in props:
+        stride //= len(values)
+        idx = (off // stride) % len(values)
+        if name in wanted and wanted[name] in values:
+            idx = values.index(wanted[name])
+        result += idx * stride
+    return result
+
+
+def decode_state(block_name, state):
+    """Inverse of state_for: {property: value} for a state id (used for tests/logging)."""
+    base, count, _ = BLOCK_STATES[block_name]
+    off, stride, out = state - base, count, {}
+    for name, values in BLOCK_PROPS.get(block_name, []):
+        stride //= len(values)
+        out[name] = values[(off // stride) % len(values)]
+    return out

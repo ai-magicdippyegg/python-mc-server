@@ -1,24 +1,31 @@
 """Block placement rules: facing-aware orientation when right-clicking a
 block face with an item.
 
-``state_for`` and ``decode_state`` translate between block state ids and
-``{property: value}`` dicts using the property tables in
-:mod:`mcproto.data`. ``build_placement`` implements vanilla's
-``getStateForPlacement`` for the common cases — stairs/doors facing the
-player, logs following the clicked face axis, slabs/stairs going top or
-bottom by cursor Y, wall variants of torches/signs/etc., doors and tall
-plants placing both halves, beds placing foot and head.
+``state_for`` and ``decode_state`` (imported from :mod:`mcproto.data`)
+translate between block state ids and ``{property: value}`` dicts.
+``build_placement`` implements vanilla's ``getStateForPlacement`` for the
+common cases — stairs/doors facing the player, logs following the clicked
+face axis, slabs/stairs going top or bottom by cursor Y, wall variants of
+torches/signs/etc., doors and tall plants placing both halves, beds
+placing foot and head, and fence/wall/pane connections to neighbours
+(delegated to :mod:`mcproto.connections`).
 
-Known limits (matches the README's Update 17 list): stairs corner shapes,
-fence/wall/pane connections, rail curves, double slabs, door hinge side.
+Known remaining limits: stairs corner shapes, rail curves, door hinge side.
 """
 
 import math
 
+from .connections import (
+    collect_neighbor_updates,
+    compute_connection_state,
+    maybe_double_slab,
+)
 from .data import (
     BLOCK_PROPS,
     BLOCK_STATES,
     ITEM_TO_BLOCK_NAME,
+    decode_state,
+    state_for,
 )
 
 # Use Item On face index (0=down, 1=up, 2=north, 3=south, 4=west, 5=east)
@@ -46,40 +53,25 @@ def nearest_looking_direction(yaw, pitch):
     return "south" if v["z"] > 0 else "north"
 
 
-def state_for(block_name, wanted):
-    """State id for block_name with the given {property: value-string} overrides
-    applied on top of the block's default state."""
-    base, count, default = BLOCK_STATES[block_name]
-    props = BLOCK_PROPS.get(block_name)
-    if not props:
-        return default
-    off = default - base
-    stride = count
-    result = base
-    for name, values in props:
-        stride //= len(values)
-        idx = (off // stride) % len(values)
-        if name in wanted and wanted[name] in values:
-            idx = values.index(wanted[name])
-        result += idx * stride
-    return result
-
-
-def decode_state(block_name, state):
-    """Inverse of state_for: {property: value} for a state id (used for tests/logging)."""
-    base, count, _ = BLOCK_STATES[block_name]
-    off, stride, out = state - base, count, {}
-    for name, values in BLOCK_PROPS.get(block_name, []):
-        stride //= len(values)
-        out[name] = values[(off // stride) % len(values)]
-    return out
-
-
-def build_placement(item_name, bx, by, bz, face, cursor_y, yaw, pitch, air_at,
+def build_placement(item_name, bx, by, bz, face, cursor_y, yaw, pitch,
+                    get_block_fn, air_state=0,
                     min_y=None, world_height=None):
     """Work out what placing item_name against block (bx,by,bz) on `face` creates.
-    Returns [(x, y, z, state, block_name), ...] (several for doors/beds), or None if
-    it can't be placed that way. air_at(x,y,z) says whether a cell is empty.
+    Returns [(x, y, z, state, block_name), ...] (several for doors/beds, plus
+    neighbour-connection updates for fences/walls/panes), or None if it
+    can't be placed that way.
+
+    ``get_block_fn(x, y, z)`` returns the block state id at a position;
+    ``air_state`` is the id that represents an empty cell.
+
+    For fence/wall/pane blocks, the returned list includes the placed block
+    (with connections to its current neighbours) PLUS an update entry for
+    each horizontal neighbour that needs its connection-back property set
+    (so a fence placed next to an existing fence updates both sides).
+
+    For slabs, if the clicked block is the same slab type, the list contains
+    a single update that converts the clicked block to ``type=double`` (no
+    new block is placed at the adjacent position).
 
     ``min_y`` and ``world_height`` are needed to bound-check door/tall-plant
     upper halves; if not supplied they're read from :mod:`mcproto.world`.
@@ -161,6 +153,18 @@ def build_placement(item_name, bx, by, bz, face, cursor_y, yaw, pitch, air_at,
                     return None
                 want.pop("facing", None)
 
+    # air_at() helper derived from get_block_fn for the door/bed checks below
+    def air_at(x, y, z):
+        return get_block_fn(x, y, z) == air_state
+
+    # ---- Double-slab shortcut: clicking an existing slab of the same type
+    # with the matching slab item converts it to type=double (no new block
+    # placed at the adjacent position).
+    if block.endswith("_slab"):
+        double_state = maybe_double_slab(item_name, bx, by, bz, get_block_fn, state_for(block, want))
+        if double_state is not None:
+            return [(bx, by, bz, double_state, block)]
+
     placed = []
     if "half" in props and "lower" in props["half"] and "upper" in props["half"]:      # doors, tall plants
         if min_y is None or world_height is None:
@@ -182,4 +186,21 @@ def build_placement(item_name, bx, by, bz, face, cursor_y, yaw, pitch, air_at,
         placed.append((px + ox, py, pz + oz, state_for(block, dict(want, part="head")), block))
     else:
         placed.append((px, py, pz, state_for(block, want), block))
+
+    # ---- Fence / wall / pane connections: recompute the placed block's
+    # state with directional connections based on current neighbours,
+    # and add neighbour updates so they connect back to the new block.
+    if placed:
+        _, _, _, placed_state, placed_name = placed[0]
+        new_state = compute_connection_state(placed_name, px, py, pz, get_block_fn, placed_state)
+        if new_state != placed_state:
+            placed[0] = (px, py, pz, new_state, placed_name)
+        # Door / bed second-half blocks don't get connection logic (they're
+        # not fences/walls/panes); only fence/wall/pane blocks produce
+        # neighbour updates here, so it's safe to call for all placed blocks.
+        if len(placed) == 1:
+            placed.extend(
+                collect_neighbor_updates(placed_name, px, py, pz, get_block_fn)
+            )
+
     return placed
