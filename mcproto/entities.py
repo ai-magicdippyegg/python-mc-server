@@ -41,6 +41,7 @@ Known limits (basic scope):
   - No entity-entity interaction (breeding, following, fleeing).
 """
 
+import math
 import random
 import struct
 import threading
@@ -75,13 +76,21 @@ def next_entity_id():
         return _entity_id_counter
 
 
+# Gravity in blocks/sec². Vanilla uses -0.08 blocks/tick² at 20 ticks/sec,
+# which is -0.08 * 20 * 20 = -32 blocks/sec² in per-second units.
+_GRAVITY = -32.0
+
+# Tick rate for the entity AI loop (seconds per tick). 0.05 = 20 ticks/sec,
+# matching vanilla. The client interpolates position updates at this rate
+# so movement looks smooth.
+_TICK_DT = 0.05
+
+
 class Entity:
-    """A simple entity with position, rotation, and random-walk AI."""
+    """A simple entity with position, rotation, gravity, and random-walk AI."""
 
     def __init__(self, entity_type, x, y, z, yaw=0.0, pitch=0.0):
         self.id = next_entity_id()
-        self.uuid = _uuid.uuid4().int >> 64, _uuid.uuid4().int >> 64  # (msb, lsb)
-        # Actually, let's use a proper random UUID
         self.uuid = (random.getrandbits(64), random.getrandbits(64))
         self.type = entity_type  # registry id (int)
         self.x = x
@@ -90,20 +99,60 @@ class Entity:
         self.yaw = yaw
         self.pitch = pitch
         self.alive = True
+        # Physics state
+        self._vel_y = 0.0  # vertical velocity (blocks/sec)
+        self._on_ground = False
         # AI state
         self._next_move_time = time.time() + random.uniform(1, 4)
         self._target_x = x
         self._target_z = z
-        self._move_speed = 0.0  # blocks per tick
+        self._move_speed = 0.0  # blocks per second
+
+    def _block_below_is_solid(self, get_block_fn, air_state):
+        """True if the block just below the entity's feet is solid."""
+        below_y = math.floor(self.y - 0.01)
+        state = get_block_fn(math.floor(self.x), below_y, math.floor(self.z))
+        return state != air_state
 
     def tick(self, dt, get_block_fn, air_state=0):
-        """Advance the entity's AI by dt seconds. Returns True if the
-        entity moved (and the caller should send a teleport packet)."""
+        """Advance the entity's physics + AI by dt seconds. Returns True if
+        the entity moved (and the caller should send a teleport packet)."""
         if not self.alive:
             return False
 
-        import math
+        moved = False
         now = time.time()
+
+        # ---- Gravity: fall until standing on a solid block ----
+        if self._on_ground:
+            # Check if we're still on solid ground (block could have been removed)
+            if not self._block_below_is_solid(get_block_fn, air_state):
+                self._on_ground = False
+                self._vel_y = 0.0
+
+        if not self._on_ground:
+            self._vel_y += _GRAVITY * dt
+            new_y = self.y + self._vel_y * dt
+            # Check if we'd land on a block during this step
+            old_below = math.floor(self.y - 0.01)
+            new_below = math.floor(new_y - 0.01)
+            if new_below < old_below:
+                # We crossed a block boundary — check if the new block below is solid
+                state = get_block_fn(math.floor(self.x), new_below, math.floor(self.z))
+                if state != air_state:
+                    # Landed — rest on top of this block
+                    self.y = float(new_below + 1)
+                    self._vel_y = 0.0
+                    self._on_ground = True
+                    moved = True
+                else:
+                    self.y = new_y
+                    moved = True
+            else:
+                self.y = new_y
+                moved = True
+
+        # ---- Random-walk AI ----
         if now >= self._next_move_time:
             # Pick a new random target within 2-5 blocks
             angle = random.uniform(0, 2 * math.pi)
@@ -111,27 +160,28 @@ class Entity:
             self._target_x = self.x + math.cos(angle) * dist
             self._target_z = self.z + math.sin(angle) * dist
             # Minecraft yaw: 0=south (+Z), 90=west (-X), 180=north (-Z), 270=east (+X)
-            # angle is standard math (0=+X, 90=+Y). Convert: yaw = -degrees(angle) - 90
             self.yaw = (-math.degrees(angle) - 90) % 360
             self._move_speed = random.uniform(0.5, 1.5)  # blocks per second
             self._next_move_time = now + random.uniform(3, 7)
 
-        # Move toward target
-        dx = self._target_x - self.x
-        dz = self._target_z - self.z
-        dist = (dx * dx + dz * dz) ** 0.5
-        if dist > 0.1:
-            speed = self._move_speed * dt
-            if dist <= speed:
-                self.x = self._target_x
-                self.z = self._target_z
-                self._move_speed = 0.0
-                self._next_move_time = now + random.uniform(1, 3)
-            else:
-                self.x += (dx / dist) * speed
-                self.z += (dz / dist) * speed
-            return True
-        return False
+        # Move toward target (only if on ground — can't walk in mid-air)
+        if self._on_ground and self._move_speed > 0:
+            dx = self._target_x - self.x
+            dz = self._target_z - self.z
+            dist = (dx * dx + dz * dz) ** 0.5
+            if dist > 0.05:
+                speed = self._move_speed * dt
+                if dist <= speed:
+                    self.x = self._target_x
+                    self.z = self._target_z
+                    self._move_speed = 0.0
+                    self._next_move_time = now + random.uniform(1, 3)
+                else:
+                    self.x += (dx / dist) * speed
+                    self.z += (dz / dist) * speed
+                moved = True
+
+        return moved
 
 
 def _pack_degrees(degrees):

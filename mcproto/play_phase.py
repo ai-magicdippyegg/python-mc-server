@@ -279,13 +279,15 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
         log(addr, f"spawned {len(entities)} animals near player")
 
     # ---- Entity AI tick loop: moves entities and sends teleport packets.
+    # Runs at 20 ticks/sec (50ms) to match vanilla — the client interpolates
+    # position updates at this rate so movement looks smooth.
     entity_state = {"alive": True}
     def entity_tick_loop():
         last_tick = time.time()
         while entity_state["alive"]:
-            time.sleep(0.5)  # 2 ticks per second
+            time.sleep(0.05)  # 20 ticks/sec
             now = time.time()
-            dt = now - last_tick
+            dt = min(now - last_tick, 0.1)  # cap dt to avoid huge jumps
             last_tick = now
             try:
                 for ent in entities:
