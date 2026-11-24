@@ -74,6 +74,14 @@ class Play:
     PLAYER_POSITION = 0x49       # synchronize player position (teleport)
     SET_CHUNK_CACHE_CENTER = 0x60
     SET_DEFAULT_SPAWN_POSITION = 0x63
+    # entity packets (IDs from GameProtocols registration order)
+    ADD_ENTITY = 0x01
+    MOVE_ENTITY_POS = 0x36
+    MOVE_ENTITY_POS_ROT = 0x37
+    MOVE_ENTITY_ROT = 0x39
+    REMOVE_ENTITIES = 0x4E
+    ROTATE_HEAD = 0x55
+    TELEPORT_ENTITY = 0x80
     # serverbound (only the ones we use)
     S_ACCEPT_TELEPORTATION = 0x00
     S_CHAT_COMMAND = 0x07

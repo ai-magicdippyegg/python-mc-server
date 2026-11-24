@@ -39,6 +39,7 @@ from .codec import (
 )
 from .connection import log
 from .data import BLOCK_STATES, OVERWORLD_DIM_TYPE_ID, item_for_state
+from .entities import Entity, ENTITY_TYPES, send_add_entity, send_remove_entities, send_teleport_entity
 from .fluid import compute_flow, compute_removal, fluid_name_for_state
 from .lighting import build_light_payload
 from .placement import build_placement, decode_state
@@ -257,6 +258,44 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
     log(addr, f"player entered the world at {px:.1f},{py:.1f},{pz:.1f}"
                 + (" (restored)" if saved else " (spawn)")
                 + (f", {len(inventory)} inventory slots restored" if inventory else ""))
+
+    # ---- Spawn a few animals near the player for basic entity support.
+    # Each player gets their own set of entities (despawned on disconnect).
+    entities = []
+    import math
+    for _ in range(random.randint(3, 6)):
+        # Pick a random animal type and position near the player
+        animal = random.choice(["chicken", "cow", "pig", "sheep"])
+        angle = random.uniform(0, 2 * math.pi)
+        dist = random.uniform(3, 12)
+        ex = px + math.cos(angle) * dist
+        ez = pz + math.sin(angle) * dist
+        ey = 1.0  # spawn at y=1 (on top of the stone floor at y=-1)
+        ent = Entity(ENTITY_TYPES[animal], ex, ey, ez,
+                     yaw=random.uniform(0, 360))
+        entities.append(ent)
+        send_add_entity(conn, ent)
+    if DEBUG and entities:
+        log(addr, f"spawned {len(entities)} animals near player")
+
+    # ---- Entity AI tick loop: moves entities and sends teleport packets.
+    entity_state = {"alive": True}
+    def entity_tick_loop():
+        last_tick = time.time()
+        while entity_state["alive"]:
+            time.sleep(0.5)  # 2 ticks per second
+            now = time.time()
+            dt = now - last_tick
+            last_tick = now
+            try:
+                for ent in entities:
+                    if ent.alive and ent.tick(dt, lambda x, y, z: get_block(x, y, z)):
+                        send_teleport_entity(conn, ent)
+            except (ConnectionError, OSError):
+                entity_state["alive"] = False
+                return
+    ent_thread = threading.Thread(target=entity_tick_loop, daemon=True)
+    ent_thread.start()
 
     try:
         while True:
@@ -697,7 +736,13 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
         pass
     finally:
         state["alive"] = False
+        entity_state["alive"] = False
         active_sessions.pop(uuid_key, None)
+        # Despawn all entities for this player
+        try:
+            send_remove_entities(conn, [e.id for e in entities if e.alive])
+        except (ConnectionError, OSError):
+            pass
         update_player(uuid_key, username, *pos_state,
                       inventory=inventory, held_slot=held_slot_box[0])
         try:
