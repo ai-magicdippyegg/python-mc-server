@@ -12,8 +12,13 @@ venv/
 # Runtime world / player data (created when the server runs)
 world_save.json
 world_save.json.old
+world_save.json.tmp
 players.json
+players.json.tmp
 *.log
+
+# Local backups made by data-table fix scripts (not for the repo)
+*.prefacingfix
 
 # Editor / OS
 .vscode/

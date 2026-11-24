@@ -76,6 +76,13 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAVE_FILE = os.environ.get("MC_SAVE_FILE", os.path.join(_PROJECT_ROOT, "world_save.json"))
 SAVE_INTERVAL = int(os.environ.get("MC_SAVE_INTERVAL", "30"))
 
+# Save format version. Bumped to 2 when the `facing` property value order in
+# block_props.json was corrected to match the Direction enum declaration
+# order — saves written before that fix hold state ids that no longer
+# decode to the same block state, so they are set aside on load rather
+# than loaded (same approach as the TOTAL_BLOCK_STATES check below).
+SAVE_VERSION = 2
+
 
 def load_world():
     if not os.path.exists(SAVE_FILE):
@@ -86,10 +93,11 @@ def load_world():
         # saves record which block-state table they were written with; a
         # save from a different table would show the wrong blocks, so it is
         # set aside rather than loaded
-        if data.get("__states__") != TOTAL_BLOCK_STATES:
+        if (data.get("__states__") != TOTAL_BLOCK_STATES
+                or data.get("__version__", 1) != SAVE_VERSION):
             stale = SAVE_FILE + ".old"
             os.replace(SAVE_FILE, stale)
-            print(f"[world] save was written with a different block table; moved to {stale}, starting a fresh world")
+            print(f"[world] save was written with an older format; moved to {stale}, starting a fresh world")
             return
         data = data["blocks"]
         with world_lock:
@@ -104,6 +112,7 @@ def load_world():
 def save_world():
     with world_lock:
         data = {"__states__": TOTAL_BLOCK_STATES,
+                "__version__": SAVE_VERSION,
                 "blocks": {f"{x},{y},{z}": state for (x, y, z), state in placed_blocks.items()}}
     # write to a temp file then rename, so a crash mid-save can't corrupt
     # the save file (same trick real servers use for region files)
