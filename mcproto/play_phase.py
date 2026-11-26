@@ -49,7 +49,7 @@ from .entities import (
     send_set_time,
     send_teleport_entity,
 )
-from .fluid import compute_flow, compute_removal, fluid_name_for_state
+from .fluid import check_infinite_water, compute_flow, compute_removal, fluid_name_for_state
 from .lighting import build_light_payload
 from .placement import build_placement, decode_state
 from .player import (
@@ -391,6 +391,7 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
     if held_slot:
         conn.send_packet(Play.SET_HELD_SLOT, write_varint(held_slot))
     held_slot_box = [held_slot]
+    breaking_pos = [None]  # (bx,by,bz) of the block being broken in survival
     active_sessions[uuid_key] = (username, pos_state, inventory, held_slot_box)
 
     log(addr, f"player entered the world at {px:.1f},{py:.1f},{pz:.1f}"
@@ -575,6 +576,20 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                                                       encode_block_pos(fx2, fy2, fz2) + write_varint(fstate))
                                 if DEBUG and flow:
                                     log(addr, f"fluid {fname} spread: placed {len(flow)} flowing blocks from ({fx},{fy},{fz})")
+                                # Check for infinite water source formation:
+                                # if 2+ adjacent water sources surround a
+                                # flowing water cell with solid below, it
+                                # becomes a source (classic 2x2 pool mechanic).
+                                if fname == "water":
+                                    iw = check_infinite_water(fx, fy, fz,
+                                                              lambda x, y, z: get_block(x, y, z),
+                                                              air_state=AIR_STATE)
+                                    for (iwx, iwy, iwz, iwstate) in iw:
+                                        set_block(iwx, iwy, iwz, iwstate)
+                                        conn.send_packet(Play.BLOCK_UPDATE,
+                                                          encode_block_pos(iwx, iwy, iwz) + write_varint(iwstate))
+                                    if DEBUG and iw:
+                                        log(addr, f"infinite water: {len(iw)} source(s) formed")
                             if DEBUG:
                                 log(addr, f"placed fluid state {fluid_state} at {fx},{fy},{fz} (held={held[0]})")
                         elif kind == "pickup":
@@ -714,11 +729,29 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                         if val: inventory[slot] = val
                         else: inventory.pop(slot, None)
                     continue
-                # 0 = START_DESTROY_BLOCK: creative mode breaks instantly
+                # 0 = START_DESTROY_BLOCK
+                # 1 = ABORT_DESTROY_BLOCK (player looked away / stopped)
+                # 2 = STOP_DESTROY_BLOCK (client says "I'm done breaking")
+                #
+                # Creative: action 0 = instant break (client expects this)
+                # Survival: action 0 = start breaking (just ACK), action 2 = break
+                #           action 1 = abort (cancel break)
+                if action == 1:  # ABORT_DESTROY_BLOCK
+                    breaking_pos[0] = None
+                    conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
+                    continue
+
+                if action == 2 and gamemode == 0:  # STOP_DESTROY_BLOCK (survival)
+                    # Client says it's done breaking — break the block now.
+                    bx, by, bz = decode_block_pos(block_val)
+                    breaking_pos[0] = None
+                    # Fall through to the block-break logic below (same as action 0)
+                    action = 0  # reuse the break code
+
                 if action == 0:
                     # ---- Entity damage: check if an entity is at/near the
-                    # clicked position. If yes, remove it (the player attacked
-                    # the entity, not the block). Check within ~1.5 blocks.
+                    # clicked position. If yes, damage it (not instant kill —
+                    # entities have health now). Check within ~2 blocks.
                     hit_entity = None
                     for ent in entities:
                         if not ent.alive or ent.type == ENTITY_TYPES.get("item"):
@@ -726,32 +759,44 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                         edx = ent.x - (bx + 0.5)
                         edy = ent.y - (by + 0.5)
                         edz = ent.z - (bz + 0.5)
-                        if edx*edx + edy*edy + edz*edz < 4.0:  # within ~2 blocks
+                        if edx*edx + edy*edy + edz*edz < 4.0:
                             hit_entity = ent
                             break
                     if hit_entity:
-                        hit_entity.alive = False
-                        send_remove_entities(conn, [hit_entity.id])
+                        # Damage the entity (4 HP per hit = 2 hearts)
+                        hit_entity.health -= 4
                         if DEBUG:
-                            log(addr, f"killed entity {hit_entity.id} at {bx},{by},{bz}")
-                        # Item drop from killed entity: in survival, spawn an
-                        # item entity on the ground (walk over to pick up).
-                        # In creative, no drops.
-                        if gamemode == 0:  # survival
-                            ent_loot = {ENTITY_TYPES["chicken"]: "chicken",
-                                        ENTITY_TYPES["cow"]: "beef",
-                                        ENTITY_TYPES["pig"]: "porkchop",
-                                        ENTITY_TYPES["sheep"]: "mutton"}.get(hit_entity.type)
-                            if ent_loot and ent_loot in ITEM_ID_BY_NAME:
-                                item_ent = Entity(ENTITY_TYPES["item"],
-                                                  hit_entity.x, hit_entity.y, hit_entity.z)
-                                item_ent._item_name = ent_loot
-                                item_ent._item_count = 1
-                                entities.append(item_ent)
-                                send_add_entity(conn, item_ent)
-                                send_item_entity_data(conn, item_ent.id, ent_loot, 1)
+                            log(addr, f"hit entity {hit_entity.id} (HP={hit_entity.health})")
+                        if hit_entity.health <= 0:
+                            hit_entity.alive = False
+                            send_remove_entities(conn, [hit_entity.id])
+                            if DEBUG:
+                                log(addr, f"killed entity {hit_entity.id}")
+                            if gamemode == 0:  # survival: drop loot
+                                ent_loot = {ENTITY_TYPES["chicken"]: "chicken",
+                                            ENTITY_TYPES["cow"]: "beef",
+                                            ENTITY_TYPES["pig"]: "porkchop",
+                                            ENTITY_TYPES["sheep"]: "mutton"}.get(hit_entity.type)
+                                if ent_loot and ent_loot in ITEM_ID_BY_NAME:
+                                    item_ent = Entity(ENTITY_TYPES["item"],
+                                                      hit_entity.x, hit_entity.y, hit_entity.z)
+                                    item_ent._item_name = ent_loot
+                                    item_ent._item_count = 1
+                                    entities.append(item_ent)
+                                    send_add_entity(conn, item_ent)
+                                    send_item_entity_data(conn, item_ent.id, ent_loot, 1)
                         conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
-                        continue  # don't break the block
+                        continue  # don't break the block behind the entity
+
+                    # ---- Survival: don't break instantly on START_DESTROY_BLOCK.
+                    # The client sends STOP_DESTROY_BLOCK (action 2) when it's
+                    # done. Just record the position and send ACK.
+                    if gamemode == 0:  # survival
+                        breaking_pos[0] = (bx, by, bz)
+                        conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
+                        continue
+
+                    # ---- Creative: break instantly (action 0).
 
                     # ---- Block break: capture the block state before breaking
                     # (needed for item drops + fluid cleanup + redstone recompute).

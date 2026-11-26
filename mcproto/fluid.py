@@ -197,3 +197,51 @@ def fluid_name_for_state(state):
         if name in BLOCK_STATES and _is_source_of_type(state, name):
             return name
     return None
+
+
+def check_infinite_water(sx, sy, sz, get_block_fn, air_state=0):
+    """Check for infinite water source formation around (sx, sy, sz).
+
+    Vanilla rule: a flowing water block (level > 0) becomes a source
+    block (level 0) if it has 2+ adjacent water sources horizontally
+    AND the block below is solid or a water source. This is how 2x2
+    pools generate infinite water.
+
+    Returns a list of (x, y, z, new_state) tuples for flowing water
+    cells that should become sources. The caller sets them and sends
+    BLOCK_UPDATE for each.
+    """
+    if "water" not in BLOCK_STATES:
+        return []
+    water_base, water_count, water_source = BLOCK_STATES["water"]
+    updates = []
+
+    # Check all flowing water cells in a 3x3 area around (sx, sy, sz)
+    for dx in range(-2, 3):
+        for dz in range(-2, 3):
+            x, y, z = sx + dx, sy, sz + dz
+            state = get_block_fn(x, y, z)
+            # Is this a flowing water block (not source, not air)?
+            if state == air_state or state == water_source:
+                continue
+            if not (water_base <= state < water_base + water_count):
+                continue
+            # Check below: must be solid or water source
+            below = get_block_fn(x, y - 1, z)
+            if below == air_state:
+                continue  # nothing below — can't form source
+            if not (below == water_source or (below != air_state and
+                                               not (water_base <= below < water_base + water_count))):
+                # below is flowing water — can't form source
+                if water_base <= below < water_base + water_count and below != water_source:
+                    continue
+            # Count adjacent water sources (horizontal only)
+            source_count = 0
+            for ddx, ddz in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+                nstate = get_block_fn(x + ddx, y, z + ddz)
+                if nstate == water_source:
+                    source_count += 1
+            if source_count >= 2:
+                updates.append((x, y, z, water_source))
+
+    return updates

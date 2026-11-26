@@ -29,12 +29,23 @@ Simplifications (basic scope):
 from .data import BLOCK_STATES, decode_state, state_for
 from .world import AIR_STATE, block_name_for_state
 
-# Power sources: block_name -> (property_name, on_value) or None for always-on
+# Power sources: block_name -> (property_name, on_value) or None for always-on.
+# Redstone torches emit power when lit=true. The inverter logic (torch turns
+# off when its attached block is powered) is handled in recompute_power.
 POWER_SOURCES = {
     "lever": ("powered", "true"),
     "redstone_torch": ("lit", "true"),
     "redstone_wall_torch": ("lit", "true"),
     "redstone_block": None,  # always 15
+}
+
+# Redstone torches: the block they're attached to is determined by their
+# facing property. For wall torches, it's the block in the opposite direction
+# of facing. For standing torches (redstone_torch), it's the block below.
+# When the attached block is powered, the torch turns OFF (inverter).
+TORCH_ATTACHED = {
+    "redstone_torch": "down",  # standing torch is on top of the block below
+    "redstone_wall_torch": "facing",  # wall torch is on the opposite side of facing
 }
 
 # Power consumers: block_name -> (property_name, on_value)
@@ -61,7 +72,9 @@ def is_lever(block_name):
 
 
 def get_source_power(block_name, state):
-    """Returns 0-15 for the power this block emits as a source."""
+    """Returns 0-15 for the power this block emits as a source.
+    For redstone torches: emits 15 when lit=true, 0 when lit=false.
+    The lit state is set by the inverter logic in recompute_power."""
     if block_name not in POWER_SOURCES:
         return 0
     prop = POWER_SOURCES[block_name]
@@ -72,6 +85,24 @@ def get_source_power(block_name, state):
     if props.get(prop_name) == on_value:
         return 15
     return 0
+
+
+def _torch_attached_pos(block_name, state, x, y, z):
+    """Returns the (x, y, z) of the block a redstone torch is attached to.
+    For standing torches: the block below.
+    For wall torches: the block in the opposite direction of facing."""
+    if block_name not in TORCH_ATTACHED:
+        return None
+    props = decode_state(block_name, state)
+    if block_name == "redstone_torch":
+        return (x, y - 1, z)  # standing torch sits on the block below
+    elif block_name == "redstone_wall_torch":
+        facing = props.get("facing", "north")
+        opposites = {"north": (0, 0, 1), "south": (0, 0, -1),
+                     "east": (-1, 0, 0), "west": (1, 0, 0)}
+        dx, dy, dz = opposites.get(facing, (0, 0, 1))
+        return (x + dx, y + dy, z + dz)
+    return None
 
 
 def toggle_lever(state):
@@ -217,6 +248,48 @@ def recompute_power(sx, sy, sz, get_block_fn, air_state=AIR_STATE):
         should_be = on_value if powered else ("false" if on_value == "true" else "true")
         if props.get(prop_name) != should_be:
             props[prop_name] = should_be
+            new_state = state_for(name, props)
+            updates.append((x, y, z, new_state))
+
+    # Update redstone torch lit states (inverter logic)
+    # A torch turns OFF when the block it's attached to is powered.
+    # This is the classic redstone inverter: power the block → torch off.
+    for cell, (name, state) in redstone_cells.items():
+        if name not in TORCH_ATTACHED:
+            continue
+        x, y, z = cell
+        attached = _torch_attached_pos(name, state, x, y, z)
+        if attached is None:
+            continue
+        ax, ay, az = attached
+        # Is the attached block powered? Check if any neighbor of the attached
+        # block (excluding the torch itself) is a power source or powered wire.
+        attached_powered = False
+        for dx, dy, dz in _DIRS_6:
+            nx, ny, nz = ax + dx, ay + dy, az + dz
+            if (nx, ny, nz) == cell:
+                continue  # don't count the torch itself
+            if (nx, ny, nz) in source_powers:
+                attached_powered = True
+                break
+            if (nx, ny, nz) in wire_power and wire_power[(nx, ny, nz)] > 0:
+                attached_powered = True
+                break
+        # Also check if the attached block itself is a solid powered block
+        # (a lever on the attached block would power it). For basic, we check
+        # if the attached block IS a power source (like a lever).
+        if not attached_powered:
+            astate = get_block_fn(ax, ay, az)
+            if astate != air_state:
+                aname = block_name_for_state(astate)
+                if aname in POWER_SOURCES and aname not in TORCH_ATTACHED:
+                    if get_source_power(aname, astate) > 0:
+                        attached_powered = True
+
+        props = decode_state(name, state)
+        should_be_lit = "false" if attached_powered else "true"
+        if props.get("lit") != should_be_lit:
+            props["lit"] = should_be_lit
             new_state = state_for(name, props)
             updates.append((x, y, z, new_state))
 

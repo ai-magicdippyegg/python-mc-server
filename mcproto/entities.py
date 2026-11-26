@@ -88,8 +88,22 @@ _GRAVITY = -32.0
 _TICK_DT = 0.05
 
 
+# Default health by entity type (vanilla values: chicken=4, cow=10, pig=10, sheep=8)
+ENTITY_HEALTH = {
+    ENTITY_TYPES["chicken"]: 4,
+    ENTITY_TYPES["cow"]: 10,
+    ENTITY_TYPES["pig"]: 10,
+    ENTITY_TYPES["sheep"]: 8,
+    ENTITY_TYPES["cat"]: 10,
+    ENTITY_TYPES["horse"]: 15,
+    ENTITY_TYPES["bat"]: 6,
+    ENTITY_TYPES["bee"]: 10,
+    ENTITY_TYPES["creeper"]: 20,
+}
+
+
 class Entity:
-    """A simple entity with position, rotation, gravity, and random-walk AI."""
+    """A simple entity with position, rotation, gravity, health, and random-walk AI."""
 
     def __init__(self, entity_type, x, y, z, yaw=0.0, pitch=0.0):
         self.id = next_entity_id()
@@ -101,6 +115,7 @@ class Entity:
         self.yaw = yaw
         self.pitch = pitch
         self.alive = True
+        self.health = ENTITY_HEALTH.get(entity_type, 10)  # default 10 HP (5 hearts)
         # Physics state
         self._vel_y = 0.0  # vertical velocity (blocks/sec)
         self._on_ground = False
