@@ -296,7 +296,28 @@ def send_remove_entities(conn, entity_ids):
 
 def send_item_entity_data(conn, entity_id, item_name, count=1):
     """Send SetEntityDataPacket so the client knows what item an item entity
-    represents. Without this, the client renders nothing (or a default shape)."""
+    represents. Without this, the client renders nothing (or a default shape).
+
+    Format (decompiled from EntityDataSerializers$1.codec() →
+    ItemStack.OPTIONAL_STREAM_CODEC):
+      VarInt entity_id
+      UByte index (8 = ItemEntity.DATA_ITEM)
+      VarInt serializer_id (7 = ITEM_STACK)
+      --- ItemStack.OPTIONAL_STREAM_CODEC ---
+      Bool present (true = has item, false = empty)
+      If present:
+        VarInt count
+        VarInt item_id
+        VarInt 0 (added components)
+        VarInt 0 (removed components)
+      --- end ---
+      UByte 0xFF (terminator)
+
+    The OPTIONAL_STREAM_CODEC wraps the regular ItemStack codec with a
+    Boolean present flag. Missing this flag was the cause of the block-break
+    crash: the client read `count` as the present flag, shifting all
+    subsequent bytes and causing a DecoderException.
+    """
     if item_name not in ITEM_ID_BY_NAME:
         return
     payload = bytearray()
@@ -304,11 +325,12 @@ def send_item_entity_data(conn, entity_id, item_name, count=1):
     # Entry: index=8 (ItemEntity.DATA_ITEM), serializer=7 (ITEM_STACK)
     payload += write_ubyte(8)
     payload += write_varint(7)
-    # ItemStack value: VarInt count, VarInt item_id, VarInt 0 (added), VarInt 0 (removed)
+    # ItemStack.OPTIONAL_STREAM_CODEC: Boolean present + regular ItemStack data
+    payload += write_bool(True)  # present = true
     payload += write_varint(count)
     payload += write_varint(ITEM_ID_BY_NAME[item_name])
-    payload += write_varint(0)
-    payload += write_varint(0)
+    payload += write_varint(0)  # added components
+    payload += write_varint(0)  # removed components
     # Terminator
     payload += write_ubyte(0xFF)
     conn.send_packet(Play.SET_ENTITY_DATA, bytes(payload))

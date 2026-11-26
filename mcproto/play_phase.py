@@ -340,21 +340,39 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
     if DEBUG and entities:
         log(addr, f"spawned {len(entities)} animals near player")
 
-    # ---- Entity AI tick loop: moves entities and sends teleport packets.
-    # Runs at 20 ticks/sec (50ms) to match vanilla — the client interpolates
-    # position updates at this rate so movement looks smooth.
+    # ---- Entity AI tick loop: moves entities, sends teleport packets, and
+    # picks up nearby item entities (adds to inventory, despawns).
+    # Runs at 20 ticks/sec (50ms) — client interpolates at this rate.
     entity_state = {"alive": True}
     def entity_tick_loop():
         last_tick = time.time()
         while entity_state["alive"]:
             time.sleep(0.05)  # 20 ticks/sec
             now = time.time()
-            dt = min(now - last_tick, 0.1)  # cap dt to avoid huge jumps
+            dt = min(now - last_tick, 0.1)
             last_tick = now
             try:
                 for ent in entities:
                     if ent.alive and ent.tick(dt, lambda x, y, z: get_block(x, y, z)):
                         send_teleport_entity(conn, ent)
+                # Item pickup: check if any item entity is near the player
+                px2, py2, pz2 = pos_state[0], pos_state[1], pos_state[2]
+                for ent in list(entities):
+                    if not ent.alive or ent.type != ENTITY_TYPES.get("item"):
+                        continue
+                    dx = ent.x - px2
+                    dy = ent.y - py2
+                    dz = ent.z - pz2
+                    if dx*dx + dy*dy + dz*dz < 2.25:  # within 1.5 blocks
+                        item_name = getattr(ent, '_item_name', None)
+                        item_count = getattr(ent, '_item_count', 1)
+                        if item_name and item_name in ITEM_ID_BY_NAME:
+                            placed = _add_to_inventory(conn, inventory, item_name, item_count, addr)
+                            if placed:
+                                ent.alive = False
+                                send_remove_entities(conn, [ent.id])
+                                if DEBUG:
+                                    log(addr, f"picked up {item_name} x{item_count}")
             except (ConnectionError, OSError):
                 entity_state["alive"] = False
                 return
@@ -640,17 +658,22 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                         send_remove_entities(conn, [hit_entity.id])
                         if DEBUG:
                             log(addr, f"killed entity {hit_entity.id} at {bx},{by},{bz}")
-                        # Item drop from killed entity: in survival, add loot
-                        # directly to inventory (no entity drop — the
-                        # SetEntityDataPacket format for item metadata causes
-                        # a client crash). In creative, no drops.
+                        # Item drop from killed entity: in survival, spawn an
+                        # item entity on the ground (walk over to pick up).
+                        # In creative, no drops.
                         if gamemode == 0:  # survival
                             ent_loot = {ENTITY_TYPES["chicken"]: "chicken",
                                         ENTITY_TYPES["cow"]: "beef",
                                         ENTITY_TYPES["pig"]: "porkchop",
                                         ENTITY_TYPES["sheep"]: "mutton"}.get(hit_entity.type)
                             if ent_loot and ent_loot in ITEM_ID_BY_NAME:
-                                _add_to_inventory(conn, inventory, ent_loot, 1, addr)
+                                item_ent = Entity(ENTITY_TYPES["item"],
+                                                  hit_entity.x, hit_entity.y, hit_entity.z)
+                                item_ent._item_name = ent_loot
+                                item_ent._item_count = 1
+                                entities.append(item_ent)
+                                send_add_entity(conn, item_ent)
+                                send_item_entity_data(conn, item_ent.id, ent_loot, 1)
                         conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
                         continue  # don't break the block
 
@@ -685,17 +708,24 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                         if DEBUG and updates:
                             log(addr, f"  redstone: {len(updates)} block(s) updated after break")
 
-                    # ---- Item drop: in survival, add the block's item directly
-                    # to the player's inventory. In creative, no drops.
-                    # (Entity-based item drops were removed because the
-                    # SetEntityDataPacket metadata format caused client crashes.)
+                    # ---- Item drop: in survival, spawn an item entity on the
+                    # ground (walk over to pick up). In creative, no drops.
+                    # The SetEntityDataPacket now uses the correct OPTIONAL_STREAM_CODEC
+                    # format (Boolean present flag + ItemStack data), confirmed
+                    # by decompiling EntityDataSerializers$1.codec().
                     if gamemode == 0:  # survival
                         drop_item = None
                         if broken_name not in ("air", "water", "lava", "powder_snow",
                                                 "bubble_column", "cave_air", "void_air"):
                             drop_item = item_for_state(broken_state)
                         if drop_item and drop_item in ITEM_ID_BY_NAME:
-                            _add_to_inventory(conn, inventory, drop_item, 1, addr)
+                            item_ent = Entity(ENTITY_TYPES["item"],
+                                              bx + 0.5, by + 0.5, bz + 0.5)
+                            item_ent._item_name = drop_item
+                            item_ent._item_count = 1
+                            entities.append(item_ent)
+                            send_add_entity(conn, item_ent)
+                            send_item_entity_data(conn, item_ent.id, drop_item, 1)
 
                 conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
 
@@ -746,14 +776,12 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                     pending_teleport[0] = send_teleport(conn, SPAWN_X + 0.5, SPAWN_Y, SPAWN_Z + 0.5)
                     pos_state[:] = [SPAWN_X + 0.5, SPAWN_Y, SPAWN_Z + 0.5, 0.0, 0.0]
                     send_chat(conn, "Teleported to spawn.")
-                    if DEBUG:
-                        log(addr, "teleported to spawn via /spawn")
+                elif command == "help":
+                    send_chat(conn, "Commands: /spawn /gamemode <survival|creative> /time <day|night|noon> /say <msg> /me <action> /help")
                 elif command.startswith("say "):
-                    # /say <message> — broadcast to all connected players
                     msg = command[4:]
                     broadcast_chat(f"[{username}] {msg}")
                 elif command.startswith("me "):
-                    # /me <action> — broadcast action to all connected players
                     msg = command[3:]
                     broadcast_chat(f"* {username} {msg}")
                 elif command == "time day":
@@ -773,7 +801,6 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                     if mode in ("0", "survival", "s"):
                         gamemode = 0
                         send_player_abilities(conn, 0)
-                        # GameEvent 2 = ChangeGameMode, param = gamemode id
                         conn.send_packet(Play.GAME_EVENT, write_ubyte(2) + write_float(0.0))
                         send_chat(conn, "Game mode set to SURVIVAL.")
                     elif mode in ("1", "creative", "c"):
@@ -783,13 +810,15 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                         send_chat(conn, "Game mode set to CREATIVE.")
                     else:
                         send_chat(conn, "Usage: /gamemode <survival|creative>")
-                    # Save gamemode
-                    from .player import players, players_lock
-                    with players_lock:
-                        if uuid_key in players:
-                            players[uuid_key]["gamemode"] = gamemode
+                    # Save gamemode to player data
+                    from .player import players as _players, players_lock as _plock
+                    with _plock:
+                        if uuid_key in _players:
+                            _players[uuid_key]["gamemode"] = gamemode
                         else:
-                            players[uuid_key] = {"gamemode": gamemode}
+                            _players[uuid_key] = {"gamemode": gamemode}
+                else:
+                    send_chat(conn, f"Unknown command: /{command}. Type /help for available commands.")
 
             elif pid == Play.S_MOVE_PLAYER_ROT:
                 if pending_teleport[0] is not None:
