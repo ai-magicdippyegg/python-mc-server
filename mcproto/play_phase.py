@@ -92,6 +92,33 @@ def broadcast_chat(text):
 _teleport_id_counter = [1]
 
 
+def _add_to_inventory(conn, inventory, item_name, count, addr):
+    """Add an item to the player's inventory (stack with existing or find
+    empty slot). Sends CONTAINER_SET_SLOT for the updated slot."""
+    # Try to stack with an existing item
+    for slot in range(9, 45):
+        cur = inventory.get(slot)
+        if cur and cur[0] == item_name and cur[1] < 64:
+            new_count = cur[1] + count
+            inventory[slot] = (item_name, new_count)
+            conn.send_packet(Play.CONTAINER_SET_SLOT,
+                              write_varint(0) + write_varint(0) + write_short(slot) +
+                              write_item_stack(item_name, new_count))
+            return True
+    # Find an empty slot
+    for slot in range(9, 45):
+        if slot not in inventory:
+            inventory[slot] = (item_name, count)
+            conn.send_packet(Play.CONTAINER_SET_SLOT,
+                              write_varint(0) + write_varint(0) + write_short(slot) +
+                              write_item_stack(item_name, count))
+            return True
+    # Inventory full — item is lost (basic: no item entity drop)
+    if DEBUG:
+        log(addr, f"inventory full, lost {count}x {item_name}")
+    return False
+
+
 def chunks_in_radius(cx, cz, radius):
     for dx in range(-radius, radius + 1):
         for dz in range(-radius, radius + 1):
@@ -156,7 +183,8 @@ def send_commands(conn):
     conn.send_packet(Play.COMMANDS, bytes(payload))
 
 
-def send_join_game(conn, entity_id):
+def send_join_game(conn, entity_id, gamemode=1):
+    """gamemode: 0=survival, 1=creative"""
     payload = bytearray()
     payload += write_int(entity_id)
     payload += write_bool(False)  # is hardcore
@@ -172,7 +200,7 @@ def send_join_game(conn, entity_id):
     payload += write_varint(OVERWORLD_DIM_TYPE_ID)  # dimension type: Holder<T> registry ref = VarInt index
     payload += write_string("minecraft:overworld")  # dimension name (ResourceKey = string)
     payload += write_long(0)      # hashed seed
-    payload += write_varint(1)    # game type: VarInt (GameType.STREAM_CODEC is idMapper/VarInt) - 1=creative
+    payload += write_varint(gamemode)  # game type: 0=survival, 1=creative
     payload += write_varint(0)    # previous game type: Optional<GameType> as VarInt, 0 = absent
     payload += write_bool(False)  # is debug
     payload += write_bool(True)   # is flat
@@ -185,8 +213,12 @@ def send_join_game(conn, entity_id):
     conn.send_packet(Play.LOGIN, bytes(payload))
 
 
-def send_player_abilities(conn):
-    flags = 0x01 | 0x04 | 0x08  # invulnerable, allow flying, creative/instant-break
+def send_player_abilities(conn, gamemode=1):
+    """gamemode: 0=survival (no flying), 1=creative (fly + invulnerable + instant-break)"""
+    if gamemode == 1:  # creative
+        flags = 0x01 | 0x04 | 0x08  # invulnerable, allow flying, creative/instant-break
+    else:  # survival
+        flags = 0x00  # nothing
     payload = write_byte(flags) + write_float(0.05) + write_float(0.1)
     conn.send_packet(Play.PLAYER_ABILITIES, payload)
 
@@ -216,8 +248,14 @@ def keepalive_thread(conn, addr, state):
 
 
 def handle_play(conn, addr, entity_id, uuid_key, username):
-    send_join_game(conn, entity_id)
-    send_player_abilities(conn)
+    # Load gamemode from saved player data (default creative for existing players)
+    from .player import players, players_lock
+    with players_lock:
+        p = players.get(uuid_key, {})
+        gamemode = p.get("gamemode", 1)  # default creative
+
+    send_join_game(conn, entity_id, gamemode)
+    send_player_abilities(conn, gamemode)
 
     # Game Event 13 = start waiting for level chunks (required for client to spawn)
     conn.send_packet(Play.GAME_EVENT, write_ubyte(13) + write_float(0.0))
@@ -305,7 +343,6 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
     # ---- Entity AI tick loop: moves entities and sends teleport packets.
     # Runs at 20 ticks/sec (50ms) to match vanilla — the client interpolates
     # position updates at this rate so movement looks smooth.
-    # Also picks up nearby item entities (adds to inventory, despawns).
     entity_state = {"alive": True}
     def entity_tick_loop():
         last_tick = time.time()
@@ -318,44 +355,6 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                 for ent in entities:
                     if ent.alive and ent.tick(dt, lambda x, y, z: get_block(x, y, z)):
                         send_teleport_entity(conn, ent)
-                # Item pickup: check if any item entity is near the player
-                px2, py2, pz2 = pos_state[0], pos_state[1], pos_state[2]
-                for ent in list(entities):
-                    if not ent.alive or ent.type != ENTITY_TYPES.get("item"):
-                        continue
-                    dx = ent.x - px2
-                    dy = ent.y - py2
-                    dz = ent.z - pz2
-                    if dx*dx + dy*dy + dz*dz < 2.25:  # within 1.5 blocks
-                        # Pick up: add to inventory, remove entity
-                        item_name = getattr(ent, '_item_name', None)
-                        item_count = getattr(ent, '_item_count', 1)
-                        if item_name:
-                            # Find an empty slot or stack with same item
-                            placed = False
-                            for slot in range(9, 45):
-                                cur = inventory.get(slot)
-                                if cur and cur[0] == item_name and cur[1] < 64:
-                                    inventory[slot] = (item_name, cur[1] + item_count)
-                                    conn.send_packet(Play.CONTAINER_SET_SLOT,
-                                                      write_varint(0) + write_varint(0) + write_short(slot) +
-                                                      write_item_stack(item_name, cur[1] + item_count))
-                                    placed = True
-                                    break
-                            if not placed:
-                                for slot in range(9, 45):
-                                    if slot not in inventory:
-                                        inventory[slot] = (item_name, item_count)
-                                        conn.send_packet(Play.CONTAINER_SET_SLOT,
-                                                          write_varint(0) + write_varint(0) + write_short(slot) +
-                                                          write_item_stack(item_name, item_count))
-                                        placed = True
-                                        break
-                            if placed:
-                                ent.alive = False
-                                send_remove_entities(conn, [ent.id])
-                                if DEBUG:
-                                    log(addr, f"picked up item {item_name} x{item_count}")
             except (ConnectionError, OSError):
                 entity_state["alive"] = False
                 return
@@ -641,22 +640,17 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                         send_remove_entities(conn, [hit_entity.id])
                         if DEBUG:
                             log(addr, f"killed entity {hit_entity.id} at {bx},{by},{bz}")
-                        # Item drop from killed entity: drop the entity's "loot"
-                        # For basic, animals drop their corresponding item (e.g.
-                        # chicken drops chicken item). Use the entity type name.
-                        ent_loot = {ENTITY_TYPES["chicken"]: "chicken",
-                                    ENTITY_TYPES["cow"]: "beef",
-                                    ENTITY_TYPES["pig"]: "porkchop",
-                                    ENTITY_TYPES["sheep"]: "mutton"}.get(hit_entity.type)
-                        if ent_loot and ent_loot in ITEM_ID_BY_NAME:
-                            import math as _m
-                            item_ent = Entity(ENTITY_TYPES["item"],
-                                              hit_entity.x, hit_entity.y, hit_entity.z)
-                            item_ent._item_name = ent_loot
-                            item_ent._item_count = 1
-                            entities.append(item_ent)
-                            send_add_entity(conn, item_ent)
-                            send_item_entity_data(conn, item_ent.id, ent_loot, 1)
+                        # Item drop from killed entity: in survival, add loot
+                        # directly to inventory (no entity drop — the
+                        # SetEntityDataPacket format for item metadata causes
+                        # a client crash). In creative, no drops.
+                        if gamemode == 0:  # survival
+                            ent_loot = {ENTITY_TYPES["chicken"]: "chicken",
+                                        ENTITY_TYPES["cow"]: "beef",
+                                        ENTITY_TYPES["pig"]: "porkchop",
+                                        ENTITY_TYPES["sheep"]: "mutton"}.get(hit_entity.type)
+                            if ent_loot and ent_loot in ITEM_ID_BY_NAME:
+                                _add_to_inventory(conn, inventory, ent_loot, 1, addr)
                         conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
                         continue  # don't break the block
 
@@ -691,20 +685,17 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                         if DEBUG and updates:
                             log(addr, f"  redstone: {len(updates)} block(s) updated after break")
 
-                    # ---- Item drop: spawn an item entity with the block's item.
-                    # Skip fluids (water/lava) and air — no item to drop.
-                    drop_item = None
-                    if broken_name not in ("air", "water", "lava", "powder_snow",
-                                            "bubble_column", "cave_air", "void_air"):
-                        drop_item = item_for_state(broken_state)
-                    if drop_item and drop_item in ITEM_ID_BY_NAME:
-                        item_ent = Entity(ENTITY_TYPES["item"],
-                                          bx + 0.5, by + 0.5, bz + 0.5)
-                        item_ent._item_name = drop_item
-                        item_ent._item_count = 1
-                        entities.append(item_ent)
-                        send_add_entity(conn, item_ent)
-                        send_item_entity_data(conn, item_ent.id, drop_item, 1)
+                    # ---- Item drop: in survival, add the block's item directly
+                    # to the player's inventory. In creative, no drops.
+                    # (Entity-based item drops were removed because the
+                    # SetEntityDataPacket metadata format caused client crashes.)
+                    if gamemode == 0:  # survival
+                        drop_item = None
+                        if broken_name not in ("air", "water", "lava", "powder_snow",
+                                                "bubble_column", "cave_air", "void_air"):
+                            drop_item = item_for_state(broken_state)
+                        if drop_item and drop_item in ITEM_ID_BY_NAME:
+                            _add_to_inventory(conn, inventory, drop_item, 1, addr)
 
                 conn.send_packet(Play.BLOCK_CHANGED_ACK, write_varint(sequence))
 
@@ -777,6 +768,28 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
                     time_state["time_of_day"] = 6000
                     send_set_time(conn, time_state["game_time"], 6000)
                     send_chat(conn, "Time set to noon.")
+                elif command.startswith("gamemode "):
+                    mode = command[9:].strip().lower()
+                    if mode in ("0", "survival", "s"):
+                        gamemode = 0
+                        send_player_abilities(conn, 0)
+                        # GameEvent 2 = ChangeGameMode, param = gamemode id
+                        conn.send_packet(Play.GAME_EVENT, write_ubyte(2) + write_float(0.0))
+                        send_chat(conn, "Game mode set to SURVIVAL.")
+                    elif mode in ("1", "creative", "c"):
+                        gamemode = 1
+                        send_player_abilities(conn, 1)
+                        conn.send_packet(Play.GAME_EVENT, write_ubyte(2) + write_float(1.0))
+                        send_chat(conn, "Game mode set to CREATIVE.")
+                    else:
+                        send_chat(conn, "Usage: /gamemode <survival|creative>")
+                    # Save gamemode
+                    from .player import players, players_lock
+                    with players_lock:
+                        if uuid_key in players:
+                            players[uuid_key]["gamemode"] = gamemode
+                        else:
+                            players[uuid_key] = {"gamemode": gamemode}
 
             elif pid == Play.S_MOVE_PLAYER_ROT:
                 if pending_teleport[0] is not None:
