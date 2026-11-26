@@ -168,18 +168,94 @@ def send_teleport(conn, x, y, z, yaw=0.0, pitch=0.0):
 
 
 def send_commands(conn):
-    """ClientboundCommandsPacket (decompiled): VarInt entry count, entries,
-    VarInt root index. Entry = byte flags, VarInt-array children, [VarInt
-    redirect if flags&8], [stub: literal = string name]. Declares one
-    executable literal command, /spawn, so the client recognizes it (and
-    offers tab-completion) instead of treating it as unknown."""
+    """ClientboundCommandsPacket — declares all commands so the client shows
+    them in the '/' suggestion list and offers tab-completion.
+
+    Command tree layout:
+      Root (0)
+      ├── spawn (1)          literal, executable
+      ├── help (2)           literal, executable
+      ├── gamemode (3)       literal, NOT executable (needs sub-command)
+      │   ├── survival (4)   literal, executable
+      │   ├── creative (5)   literal, executable
+      │   ├── s (6)          literal, executable
+      │   ├── c (7)          literal, executable
+      │   ├── 0 (8)          literal, executable
+      │   └── 1 (9)          literal, executable
+      ├── time (10)          literal, NOT executable (needs sub-command)
+      │   ├── day (11)       literal, executable
+      │   ├── night (12)     literal, executable
+      │   └── noon (13)      literal, executable
+      ├── say (14)           literal, executable
+      └── me (15)            literal, executable
+
+    Entry format:
+      UByte flags (bits 0-1 = type [0=root,1=literal,2=arg], bit 2 = executable,
+                   bit 3 = has redirect, bit 4 = has custom suggestions)
+      VarInt children_count, VarInt[children_count] child indices
+      [If literal: String name]
+      [If argument: String name, VarInt parser_id, parser-specific data]
+    """
+    entries = []
+
+    def add_literal(name, executable=True, children=None):
+        """Returns the index of the new entry."""
+        idx = len(entries)
+        flags = 0x01  # literal type
+        if executable:
+            flags |= 0x04  # executable bit
+        entry = bytearray()
+        entry += write_ubyte(flags)
+        kids = children or []
+        entry += write_varint(len(kids))
+        for k in kids:
+            entry += write_varint(k)
+        entry += write_string(name)
+        entries.append(entry)
+        return idx
+
+    def add_root(children):
+        idx = len(entries)
+        entry = bytearray()
+        entry += write_ubyte(0x00)  # root type, not executable
+        entry += write_varint(len(children))
+        for k in children:
+            entry += write_varint(k)
+        entries.append(entry)
+        return idx
+
+    # Build the tree bottom-up so we can reference child indices.
+    # /gamemode sub-commands
+    i_survival = add_literal("survival")
+    i_creative = add_literal("creative")
+    i_s = add_literal("s")
+    i_c = add_literal("c")
+    i_0 = add_literal("0")
+    i_1 = add_literal("1")
+    i_gamemode = add_literal("gamemode", executable=False,
+                             children=[i_survival, i_creative, i_s, i_c, i_0, i_1])
+
+    # /time sub-commands
+    i_day = add_literal("day")
+    i_night = add_literal("night")
+    i_noon = add_literal("noon")
+    i_time = add_literal("time", executable=False, children=[i_day, i_night, i_noon])
+
+    # Standalone commands
+    i_say = add_literal("say")
+    i_me = add_literal("me")
+    i_help = add_literal("help")
+    i_spawn = add_literal("spawn")
+
+    # Root
+    i_root = add_root([i_spawn, i_help, i_gamemode, i_time, i_say, i_me])
+
+    # Build the packet
     payload = bytearray()
-    payload += write_varint(2)
-    # entry 0: root node, one child (entry 1)
-    payload += write_ubyte(0) + write_varint(1) + write_varint(1)
-    # entry 1: literal "spawn", executable (0x04) | literal type (0x01), no children
-    payload += write_ubyte(0x05) + write_varint(0) + write_string("spawn")
-    payload += write_varint(0)  # root index
+    payload += write_varint(len(entries))
+    for entry in entries:
+        payload += entry
+    payload += write_varint(i_root)
     conn.send_packet(Play.COMMANDS, bytes(payload))
 
 
