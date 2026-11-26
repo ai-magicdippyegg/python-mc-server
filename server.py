@@ -44,7 +44,7 @@ from mcproto.connection import Connection, log
 from mcproto.player import autosave_loop, load_players, save_players
 from mcproto.play_phase import handle_play
 from mcproto.protocol import Login
-from mcproto.world import load_world, save_world, SAVE_FILE, SAVE_INTERVAL
+from mcproto.world import load_world, save_world, SAVE_FILE, SAVE_INTERVAL, placed_blocks, generate_trees
 
 HOST = os.environ.get("MC_HOST", "0.0.0.0")
 PORT = int(os.environ.get("MC_PORT", "25565"))
@@ -91,7 +91,7 @@ def handle_client(sock, addr):
             status = {
                 "version": {"name": GAME_VERSION_NAME, "protocol": PROTOCOL_VERSION},
                 "players": {"max": 20, "online": 0, "sample": []},
-                "description": {"text": "Basic Python MC Server (flat/creative)"},
+                "description": {"text": "A Minecraft Server"},
             }
             conn.send_packet(0x00, write_string(json.dumps(status)))
             pid, r = conn.read_packet()  # ping request
@@ -160,6 +160,9 @@ def main():
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
     load_world()
+    # If the world is fresh (no placed blocks), generate trees
+    if not placed_blocks:
+        generate_trees()
     load_players()
     t = threading.Thread(target=autosave_loop, args=(SAVE_INTERVAL,), daemon=True)
     t.start()
@@ -186,7 +189,6 @@ def main():
             print(f"failed to save players on shutdown: {e}")
         try:
             save_world()
-            from mcproto.world import placed_blocks
             print(f"saved {len(placed_blocks)} changed blocks to {SAVE_FILE}")
         except Exception as e:
             print(f"failed to save on shutdown: {e}")

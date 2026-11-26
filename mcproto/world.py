@@ -40,7 +40,12 @@ STONE_STATE = 1  # best-guess global block state id, see module docstring
 MIN_Y = -64
 WORLD_HEIGHT = 384
 SECTION_COUNT = WORLD_HEIGHT // 16
-GROUND_TOP_Y = -1  # topmost solid (stone) layer; y >= 0 is air
+GROUND_TOP_Y = -1  # topmost solid layer (grass); y >= 0 is air
+
+# Block state IDs for the world surface layers
+GRASS_STATE = 9     # grass_block[snowy=false]
+DIRT_STATE = 10     # dirt
+BEDROCK_STATE = 88  # bedrock
 
 # ---------------------------------------------------------------------------
 # Mutable world state — placed-block overlay
@@ -51,10 +56,24 @@ world_lock = threading.Lock()
 
 
 def get_block(x, y, z):
+    """Get the block state at (x, y, z). Checks the placed-block overlay
+    first, then falls back to the baseline terrain:
+      y == GROUND_TOP_Y (-1):  grass_block
+      y == -2 to -3:           dirt
+      y == MIN_Y (-64):        bedrock
+      y < -3 (down to -63):    stone
+      y >= 0:                  air
+    """
     with world_lock:
         if (x, y, z) in placed_blocks:
             return placed_blocks[(x, y, z)]
-    if MIN_Y <= y <= GROUND_TOP_Y:
+    if y == GROUND_TOP_Y:
+        return GRASS_STATE
+    if GROUND_TOP_Y - 2 <= y < GROUND_TOP_Y:  # y == -2 or -3
+        return DIRT_STATE
+    if y == MIN_Y:  # bedrock layer at the very bottom
+        return BEDROCK_STATE
+    if MIN_Y < y < GROUND_TOP_Y - 2:  # y == -4 to -63
         return STONE_STATE
     return AIR_STATE
 
@@ -81,7 +100,7 @@ SAVE_INTERVAL = int(os.environ.get("MC_SAVE_INTERVAL", "30"))
 # order — saves written before that fix hold state ids that no longer
 # decode to the same block state, so they are set aside on load rather
 # than loaded (same approach as the TOTAL_BLOCK_STATES check below).
-SAVE_VERSION = 2
+SAVE_VERSION = 3  # v3: grass/dirt surface + bedrock layer (was all stone)
 
 
 def load_world():
@@ -148,15 +167,27 @@ def build_section_bytes(block_state_id, biome_id, block_count):
 
 def build_chunk_column(chunk_x, chunk_z):
     """Builds the 'data' byte array for Level Chunk with Light: one section
-    per 16 vertical blocks, bottom (y=-64) to top."""
+    per 16 vertical blocks, bottom (y=-64) to top.
+
+    Baseline terrain (when no player-placed overrides):
+      y == GROUND_TOP_Y (-1):  grass_block
+      y == -2 to -3:           dirt
+      y == MIN_Y (-64):        bedrock
+      y == -4 to -63:          stone
+      y >= 0:                  air
+    Player-placed blocks override the baseline.
+    """
     sections = bytearray()
 
-    # figure out which world-y range each section covers, relative to MIN_Y
     for section_index in range(SECTION_COUNT):
         section_min_y = MIN_Y + section_index * 16
         section_max_y = section_min_y + 15
 
+        # Collect overrides for this section: player-placed blocks AND
+        # baseline surface/bedrock layers.
         overrides = {}
+
+        # Player-placed blocks
         if placed_blocks:
             with world_lock:
                 for (px, py, pz), state in placed_blocks.items():
@@ -164,27 +195,34 @@ def build_chunk_column(chunk_x, chunk_z):
                             and section_min_y <= py <= section_max_y):
                         overrides[(px, py, pz)] = state
 
+        # Baseline surface layers (grass/dirt/bedrock) — only for sections
+        # that contain these Y levels. Player-placed overrides take priority
+        # (checked via `not in overrides`).
+        if section_min_y <= GROUND_TOP_Y <= section_max_y or section_min_y <= MIN_Y <= section_max_y:
+            for lx in range(16):
+                for lz in range(16):
+                    wx = chunk_x * 16 + lx
+                    wz = chunk_z * 16 + lz
+                    for ly in range(16):
+                        wy = section_min_y + ly
+                        key = (wx, wy, wz)
+                        if key in overrides:
+                            continue  # player override takes priority
+                        if wy == GROUND_TOP_Y:
+                            overrides[key] = GRASS_STATE
+                        elif GROUND_TOP_Y - 2 <= wy < GROUND_TOP_Y:
+                            overrides[key] = DIRT_STATE
+                        elif wy == MIN_Y:
+                            overrides[key] = BEDROCK_STATE
+
         if not overrides:
-            # whole section is uniform: either all stone or all air
+            # Uniform section: all stone or all air
             if section_max_y <= GROUND_TOP_Y:
                 sections += build_section_bytes(STONE_STATE, PLAINS_BIOME_ID, 4096)
             else:
                 sections += build_section_bytes(AIR_STATE, PLAINS_BIOME_ID, 0)
         else:
-            # A section with player-placed overrides. IMPORTANT: this must
-            # NOT use a "direct/global" container (bits > 8) with an
-            # arbitrary bit width like we first tried - decompiling
-            # PalettedContainer.createOrReuseData showed that for Global
-            # configs the reader ignores the transmitted bit count and
-            # instead re-sizes storage to Strategy.globalPaletteBitsInMemory
-            # (== ceil(log2(total block STATE count)) for this exact jar,
-            # a number we can't reliably reproduce without running the
-            # game) - any mismatch between that and what we actually wrote
-            # corrupts every section after it. A LINEAR palette (bits 1-4)
-            # has no such ambiguity: Configuration.Simple.bitsInMemory()
-            # always equals exactly the bits we send, confirmed via
-            # decompile. Our overrides are always just STONE/AIR anyway, so
-            # a small palette is a natural fit, not a workaround.
+            # Non-uniform section — build with palette encoding
             entries = []
             count = 0
             for ly in range(16):
@@ -206,12 +244,6 @@ def build_chunk_column(chunk_x, chunk_z):
                 if state not in palette_index:
                     palette_index[state] = len(palette)
                     palette.append(state)
-            # Palette choice (Strategy.getConfigurationForBitCount, decompiled):
-            #   1-4 bits -> linear palette (always 4 bits in memory), up to 16 blocks
-            #   5-8 bits -> hashmap palette, bits in memory == bits sent, up to 256 blocks
-            #   9+  bits -> global ids, in-memory width = ceillog2(total block states)
-            # linear/hashmap use a palette table + packed indices; the global
-            # case writes no table and packs the raw state ids themselves.
             n_distinct = len(palette)
             if n_distinct <= 16:
                 bits_per_entry = 4
@@ -220,7 +252,7 @@ def build_chunk_column(chunk_x, chunk_z):
                 bits_per_entry = max(5, (n_distinct - 1).bit_length())
                 use_palette = True
             else:
-                bits_per_entry = (TOTAL_BLOCK_STATES - 1).bit_length()  # ceillog2
+                bits_per_entry = (TOTAL_BLOCK_STATES - 1).bit_length()
                 use_palette = False
 
             sec = bytearray()
@@ -247,7 +279,6 @@ def build_chunk_column(chunk_x, chunk_z):
                 longs.append(cur)
             for lv in longs:
                 sec += write_long(lv if lv < 2**63 else lv - 2**64)
-            # biomes: uniform plains (single-valued palette, no trailing data)
             sec += write_ubyte(0)
             sec += write_varint(PLAINS_BIOME_ID)
             sections += sec
@@ -260,3 +291,51 @@ def block_name_for_state(state):
     import bisect
     i = bisect.bisect_right(_STATE_STARTS, state) - 1
     return _STATE_RANGES[i][1] if i >= 0 else "air"
+
+
+# ---------------------------------------------------------------------------
+# Tree generation: scatter a few oak trees around spawn so the world
+# doesn't look completely barren. Trees are stored as placed_blocks
+# (saved/loaded with the world). Called once on first world load.
+# ---------------------------------------------------------------------------
+
+OAK_LOG_STATE = 140    # oak_log[axis=y] (default state)
+OAK_LEAVES_STATE = 268 # oak_leaves[distance=1,persistent=false,waterlogged=false] (default)
+
+import random as _tree_random
+import math as _tree_math
+
+def _place_tree(x, ground_y, z, height=4):
+    """Place an oak tree at (x, ground_y+1, z) with the given trunk height.
+    ground_y is the top solid block (grass). The trunk starts at ground_y+1."""
+    trunk_base = ground_y + 1
+    # Trunk
+    for dy in range(height):
+        placed_blocks[(x, trunk_base + dy, z)] = OAK_LOG_STATE
+    # Leaves: 5x5 ring at top-1, 3x3 at top, plus +1 above
+    top = trunk_base + height - 1
+    for dy, radius in [(0, 2), (1, 1), (2, 1)]:
+        ly = top - 1 + dy
+        for dx in range(-radius, radius + 1):
+            for dz in range(-radius, radius + 1):
+                if dx == 0 and dz == 0 and dy < 2:
+                    continue  # trunk space
+                if abs(dx) == radius and abs(dz) == radius:
+                    continue  # corners cut (round canopy)
+                lx, lz = x + dx, z + dz
+                if (lx, ly, lz) not in placed_blocks:
+                    placed_blocks[(lx, ly, lz)] = OAK_LEAVES_STATE
+
+
+def generate_trees():
+    """Generate scattered oak trees around spawn (called once on fresh world)."""
+    with world_lock:
+        _tree_random.seed(42)  # deterministic — same tree positions every restart
+        for _ in range(12):
+            angle = _tree_random.uniform(0, 2 * _tree_math.pi)
+            dist = _tree_random.uniform(5, 35)
+            tx = int(8 + _tree_math.cos(angle) * dist)
+            tz = int(8 + _tree_math.sin(angle) * dist)
+            height = _tree_random.randint(4, 6)
+            _place_tree(tx, GROUND_TOP_Y, tz, height)
+    print(f"[world] generated trees around spawn")

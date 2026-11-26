@@ -44,6 +44,7 @@ from .entities import (
     Entity,
     send_add_entity,
     send_chat,
+    send_health,
     send_item_entity_data,
     send_remove_entities,
     send_set_time,
@@ -459,7 +460,7 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
     # ---- Day/night cycle: send SetTimePacket every second so the world
     # clock advances. Time wraps at 24000 (one Minecraft day = 20 minutes
     # real time at 20 ticks/sec).
-    time_state = {"alive": True, "game_time": 0, "time_of_day": 6000}  # start at noon
+    time_state = {"alive": True, "game_time": 0, "time_of_day": 0}  # start at dawn
     def time_thread():
         while time_state["alive"]:
             time.sleep(1.0)  # update every second
@@ -475,6 +476,8 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
 
     # Send a welcome chat message
     send_chat(conn, f"Welcome, {username}!")
+    # Send health/food HUD (full in creative, full in survival on join)
+    send_health(conn, health=20.0, food=20, saturation=5.0)
     # Register as a chat listener (for /say, /me, join/leave broadcasts)
     with _chat_listeners_lock:
         _chat_listeners.append((conn, username))

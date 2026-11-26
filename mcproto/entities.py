@@ -404,3 +404,17 @@ def send_chat(conn, text):
     payload += _nbt_text_component(text)
     payload += write_bool(False)  # not an overlay (shows in chat, not action bar)
     conn.send_packet(Play.SYSTEM_CHAT, bytes(payload))
+
+
+def send_health(conn, health=20.0, food=20, saturation=5.0):
+    """Send ClientboundSetHealthPacket to update the player's health, food,
+    and saturation in the HUD.
+    Format (decompiled): Float health, VarInt food, Float saturation.
+    health: 0-20 (20 = full, 10 hearts). 0 = dead.
+    food: 0-20 (20 = full, 10 drumsticks).
+    saturation: 0-5 (controls how fast food drains)."""
+    payload = bytearray()
+    payload += write_float(health)
+    payload += write_varint(food)
+    payload += write_float(saturation)
+    conn.send_packet(Play.SET_HEALTH, bytes(payload))

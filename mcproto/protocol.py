@@ -86,6 +86,7 @@ class Play:
     SET_TIME = 0x73
     SYSTEM_CHAT = 0x7C
     SET_ENTITY_DATA = 0x65
+    SET_HEALTH = 0x6A
     # serverbound (only the ones we use)
     S_ACCEPT_TELEPORTATION = 0x00
     S_CHAT_COMMAND = 0x07
