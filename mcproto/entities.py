@@ -311,43 +311,38 @@ def send_remove_entities(conn, entity_ids):
 
 def send_item_entity_data(conn, entity_id, item_name, count=1):
     """Send SetEntityDataPacket so the client knows what item an item entity
-    represents. Without this, the client renders nothing (or a default shape).
+    represents. Without this, the client renders nothing.
 
-    Format (decompiled from EntityDataSerializers$1.codec() →
-    ItemStack.OPTIONAL_STREAM_CODEC):
+    Format (decompiled from createOptionalStreamCodec in ItemStack):
       VarInt entity_id
       UByte index (8 = ItemEntity.DATA_ITEM)
       VarInt serializer_id (7 = ITEM_STACK)
-      --- ItemStack.OPTIONAL_STREAM_CODEC ---
-      Bool present (true = has item, false = empty)
-      If present:
-        VarInt count
-        VarInt item_id
-        VarInt 0 (added components)
-        VarInt 0 (removed components)
+      --- ItemStack.OPTIONAL_STREAM_CODEC (same as write_item_stack) ---
+      VarInt count (0 = empty, no further data; >0 = has item)
+      VarInt item_id (if count > 0)
+      VarInt 0 (added components, if count > 0)
+      VarInt 0 (removed components, if count > 0)
       --- end ---
       UByte 0xFF (terminator)
 
-    The OPTIONAL_STREAM_CODEC wraps the regular ItemStack codec with a
-    Boolean present flag. Missing this flag was the cause of the block-break
-    crash: the client read `count` as the present flag, shifting all
-    subsequent bytes and causing a DecoderException.
+    IMPORTANT: There is NO boolean present flag. The OPTIONAL_STREAM_CODEC
+    uses count 0 = empty (same as the container-slot format). An earlier
+    version of this function incorrectly added write_bool(True) before the
+    count, based on how older Minecraft (pre-1.20.5) handled optional
+    ItemStacks. In 1.20.5+/26.3, the format changed to count-based.
     """
     if item_name not in ITEM_ID_BY_NAME:
         return
     payload = bytearray()
     payload += write_varint(entity_id)
-    # Entry: index=8 (ItemEntity.DATA_ITEM), serializer=7 (ITEM_STACK)
-    payload += write_ubyte(8)
-    payload += write_varint(7)
-    # ItemStack.OPTIONAL_STREAM_CODEC: Boolean present + regular ItemStack data
-    payload += write_bool(True)  # present = true
+    payload += write_ubyte(8)      # index: ItemEntity.DATA_ITEM
+    payload += write_varint(7)     # serializer: ITEM_STACK
+    # ItemStack.OPTIONAL_STREAM_CODEC — same format as write_item_stack
     payload += write_varint(count)
     payload += write_varint(ITEM_ID_BY_NAME[item_name])
-    payload += write_varint(0)  # added components
-    payload += write_varint(0)  # removed components
-    # Terminator
-    payload += write_ubyte(0xFF)
+    payload += write_varint(0)     # added components
+    payload += write_varint(0)     # removed components
+    payload += write_ubyte(0xFF)   # terminator
     conn.send_packet(Play.SET_ENTITY_DATA, bytes(payload))
 
 
