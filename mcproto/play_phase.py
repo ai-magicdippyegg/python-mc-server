@@ -897,8 +897,12 @@ def handle_play(conn, addr, entity_id, uuid_key, username):
         time_state["alive"] = False
         active_sessions.pop(uuid_key, None)
         # Unregister chat listener + broadcast leave
+        # Use slice assignment ([:]) to mutate the existing list rather than
+        # rebinding _chat_listeners — a plain = would make Python treat it
+        # as a local variable throughout handle_play, causing UnboundLocalError
+        # at the .append() call earlier in the function.
         with _chat_listeners_lock:
-            _chat_listeners = [(c, n) for c, n in _chat_listeners if c is not conn]
+            _chat_listeners[:] = [(c, n) for c, n in _chat_listeners if c is not conn]
         broadcast_chat(f"{username} left the game")
         # Despawn all entities for this player
         try:
